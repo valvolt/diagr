@@ -1,0 +1,2075 @@
+<!doctype html>
+<!--
+Small single-file client-side diagram editor
+- Left column: four textareas (assets, storages, connectors, flows)
+- Right column: SVG rendering with automatic layout (dagre if available)
+- No build step: open this file in a modern browser
+
+Accepted line formats:
+
+Assets / Storages (one per line)
+  id[: label]
+  Examples:
+    A:User
+    B
+
+Connectors (asset <-> asset) (one per line)
+  source -> target
+  source <-> target
+  asset -> storage : write
+  asset <- storage : read
+  asset <-> storage : read-write
+  Examples:
+    A -> B
+    A <-> B
+    App -> DB : write
+    DB <- App : read
+    App <-> DB : read-write
+
+Open the file in a and edit the left panes; the diagram auto-updates.
+-->
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Small Diagram Editor</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root{
+      --gap:12px;
+      --pane-width:360px;
+      --bg:#f6f7f9;
+      --card:#fff;
+      --muted:#555;
+      --accent:#2463a6;
+      --stroke:#333;
+    }
+    html,body{height:100%;margin:0;font-family:Inter,Segoe UI,Helvetica,Arial,sans-serif;background:var(--bg);}
+    .app{display:flex;height:100vh;gap:var(--gap);padding:var(--gap);}
+    .left{width:var(--pane-width);display:flex;flex-direction:column;gap:10px;}
+    .panel{background:var(--card);border-radius:8px;padding:10px;box-shadow:0 1px 3px rgba(0,0,0,0.06);display:flex;flex-direction:column;gap:8px;flex:0 0 auto;min-height:0}
+    label{font-weight:600;color:var(--muted);font-size:13px;display:flex;justify-content:space-between;align-items:center}
+    textarea{width:100%;height:100%;resize:none;padding:8px;border-radius:6px;border:1px solid #e2e8f0;font-family:monospace;font-size:13px;box-sizing:border-box;min-height:80px;overflow:auto}
+    .annotated-editor{width:100%;resize:none;padding:8px;border-radius:6px;border:1px solid #e2e8f0;font-family:monospace;font-size:13px;box-sizing:border-box;min-height:80px;overflow:auto;white-space:pre-wrap;word-wrap:break-word;outline:none;line-height:1.4}
+    .annotated-editor:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(36,99,166,0.15)}
+    .annotated-editor:empty::before{content:attr(data-placeholder);color:#999;pointer-events:none}
+    .ghost-label{color:#999;font-style:italic;pointer-events:none;user-select:none}
+    .right{flex:1;background:linear-gradient(180deg,#fff, #fbfdff);border-radius:8px;padding:10px;display:flex;flex-direction:column;gap:8px;min-width:0}
+    .canvas-wrapper{flex:1;border-radius:6px;background:#fff;overflow:auto;display:flex;align-items:center;justify-content:center;padding:6px;border:1px solid #e6eef8}
+    .svg-canvas{width:100%;height:100%}
+    .hint{font-size:12px;color:var(--muted)}
+    .errors{color:#b00020;font-size:12px}
+    .top-row{display:flex;gap:8px;align-items:center}
+    button{padding:6px 10px;border-radius:6px;background:var(--accent);color:#fff;border:none;cursor:pointer}
+    .footer{font-size:12px;color:var(--muted);text-align:right}
+    /* responsive */
+    @media (max-width:880px){ .app{flex-direction:column} .left{width:100%;order:2} .right{order:1;height:50vh} }
+  </style>
+
+  <!-- dagre (layout) via CDN; if unavailable the app falls back to a simple grid layout -->
+  <script src="https://unpkg.com/dagre@0.8.5/dist/dagre.min.js"></script>
+</head>
+<body>
+  <div class="app">
+    <div class="left">
+      <div class="panel">
+        <div class="top-row">
+          <label>Assets</label>
+          <span class="hint">id[: label], one per line</span>
+        </div>
+        <textarea id="assets" placeholder="H1: Alice (admin)\nH2: Bob (user)\nA1: Browser\nA2: Web app\nA3M: Cluster">H1: Alice (admin)
+H2: Bob (user)
+A1: Browser
+A2: Web app
+A3M: Cluster</textarea>
+        <div id="assets-err" class="errors" style="display:none"></div>
+      </div>
+
+      <div class="panel">
+        <div class="top-row">
+          <label>Storages</label>
+          <span class="hint">id[: label], one per line</span>
+        </div>
+        <textarea id="storages" placeholder="S1: Database\nS2: cache">S1: Database
+S2: cache</textarea>
+        <div id="storages-err" class="errors" style="display:none"></div>
+      </div>
+
+      <div class="panel">
+        <div class="top-row">
+          <label>Inside</label>
+          <span class="hint">child in parent, one per line</span>
+        </div>
+        <div id="inside" class="annotated-editor" contenteditable="true" data-placeholder="child in parent, one per line"></div>
+        <div id="inside-err" class="errors" style="display:none"></div>
+      </div>
+
+      <div class="panel">
+        <div class="top-row">
+          <label>Connectors</label>
+          <span class="hint">A -> B, A <-> B, optional :label</span>
+        </div>
+        <div id="connectors" class="annotated-editor" contenteditable="true" data-placeholder="A -> B, A <-> B, optional :label"></div>
+        <div id="connectors-err" class="errors" style="display:none"></div>
+      </div>
+    </div>
+
+    <div class="right">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <div><strong>Diagram</strong><div class="hint">Auto layout, fit-to-view</div></div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <input id="import-file" type="file" accept=".txt" style="display:none" />
+          <button id="import-btn">Import</button>
+          <button id="export-btn">Export</button>
+          <button id="export-svg-btn">Export SVG</button>
+          <button id="export-png-btn">Export PNG</button>
+          <button id="clear-btn" style="background:#9ca3af">Clear</button>
+          <div class="hint" id="summary"></div>
+        </div>
+      </div>
+
+      <div class="canvas-wrapper">
+        <svg id="svg" class="svg-canvas" viewBox="0 0 1000 600" preserveAspectRatio="xMidY meet" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="strokeWidth" markerWidth="8" markerHeight="8" orient="auto">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="#333"></path>
+            </marker>
+            <marker id="arrow-small" viewBox="0 0 10 10" refX="8" refY="5" markerUnits="strokeWidth" markerWidth="6" markerHeight="6" orient="auto">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="#333"></path>
+            </marker>
+            <marker id="circle-start" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="strokeWidth" markerWidth="7" markerHeight="7" orient="auto">
+              <circle cx="5" cy="5" r="4" fill="#fff" stroke="#333" stroke-width="1.5"/>
+            </marker>
+            <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+              <feDropShadow dx="0" dy="1" stdDeviation="1" flood-color="#000" flood-opacity="0.08"/>
+            </filter>
+          </defs>
+          <g id="nodes"></g>
+          <g id="edges"></g>
+          <g id="decor"></g>
+        </svg>
+      </div>
+
+      <div class="footer">Open this file locally in your browser. No server required.</div>
+    </div>
+  </div>
+
+<script>
+(() => {
+
+  // Element refs
+  const $ = id => document.getElementById(id);
+  const assetsTA = $('assets');
+  const storagesTA = $('storages');
+  const insideTA = $('inside');
+  const connectorsTA = $('connectors');
+  const svg = $('svg');
+  const nodesG = $('nodes');
+  const edgesG = $('edges');
+  const decorG = $('decor');
+  const summary = $('summary');
+
+  // Debounce helper
+  function debounce(fn, ms){ let t; return (...args)=>{ clearTimeout(t); t = setTimeout(()=>fn(...args), ms); }; }
+
+  // Parsing helpers
+  function parseLines(text){
+    return text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  }
+
+  function parseIdLabel(line){
+    const m = line.match(/^([^:]+)(?::\s*(.+))?$/);
+    if(!m) return null;
+    return { id: m[1].trim(), label: (m[2]||m[1]).trim() };
+  }
+
+  function parseInside(lines){
+    // lines like: A in B
+    const out = [];
+    for(const l of lines){
+      const m = l.match(/^([^:\s]+)\s+in\s+([^:\s]+)$/i);
+      if(!m) continue;
+      out.push({ child: m[1].trim(), parent: m[2].trim() });
+    }
+    return out;
+  }
+
+  // --- Annotated editor helpers (contenteditable with inline ghost labels) ---
+
+  // Build map of all known IDs → labels from current assets/storages textareas
+  function buildIdLabelMap(){
+    const map = new Map();
+    for(const l of parseLines(assetsTA.value)){
+      const p = parseIdLabel(l);
+      if(p) map.set(p.id, p.label);
+    }
+    for(const l of parseLines(storagesTA.value)){
+      const p = parseIdLabel(l);
+      if(p) map.set(p.id, p.label);
+    }
+    return map;
+  }
+
+  // Get raw text from an annotated editor (strip ghost labels)
+  function getEditorRawText(el){
+    const clone = el.cloneNode(true);
+    clone.querySelectorAll('.ghost-label').forEach(s => s.remove());
+    return (clone.innerText || '').replace(/\u00a0/g, ' ');
+  }
+
+  // Caret offset (in raw-text chars, skipping ghost spans)
+  function getCaretOffset(el){
+    const sel = window.getSelection();
+    if(!sel.rangeCount) return 0;
+    const range = sel.getRangeAt(0);
+    const pre = range.cloneRange();
+    pre.selectNodeContents(el);
+    pre.setEnd(range.startContainer, range.startOffset);
+    // Count text in pre-range, skipping ghost spans
+    const frag = pre.cloneContents();
+    frag.querySelectorAll('.ghost-label').forEach(s => s.remove());
+    const div = document.createElement('div');
+    div.appendChild(frag);
+    return (div.innerText || '').replace(/\u00a0/g, ' ').length;
+  }
+
+  function setCaretOffset(el, offset){
+    const sel = window.getSelection();
+    const range = document.createRange();
+    let remaining = offset;
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
+      acceptNode(node){
+        // Skip text nodes inside ghost-label spans
+        if(node.parentElement && node.parentElement.classList.contains('ghost-label')) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+    let node;
+    while((node = walker.nextNode())){
+      const text = node.textContent.replace(/\u00a0/g, ' ');
+      if(remaining <= text.length){
+        range.setStart(node, Math.min(remaining, node.textContent.length));
+        range.collapse(true);
+        sel.removeAllRanges();
+        sel.addRange(range);
+        return;
+      }
+      remaining -= text.length;
+    }
+    // Fallback: place at end
+    range.selectNodeContents(el);
+    range.collapse(false);
+    sel.removeAllRanges();
+    sel.addRange(range);
+  }
+
+  // Escape HTML
+  function escHtml(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+  // Annotate a single line: resolve recognized IDs with ghost labels
+  function annotateLine(line, idLabelMap){
+    if(!line.trim()) return escHtml(line);
+    // Try connector/flow pattern: ID op ID [: label]
+    const connMatch = line.match(/^(\s*)([^\s<\->]+)(\s*(?:<->|->|<-)\s*)([^:\s]+)((?:\s*:\s*.*)?)$/);
+    if(connMatch){
+      const [, ws, left, op, right, rest] = connMatch;
+      let html = escHtml(ws) + escHtml(left);
+      const leftLabel = idLabelMap.get(left);
+      if(leftLabel && leftLabel !== left) html += `<span class="ghost-label"> ${escHtml(leftLabel)}</span>`;
+      html += escHtml(op) + escHtml(right);
+      const rightLabel = idLabelMap.get(right);
+      if(rightLabel && rightLabel !== right) html += `<span class="ghost-label"> ${escHtml(rightLabel)}</span>`;
+      html += escHtml(rest);
+      return html;
+    }
+    // Try inside pattern: ID in ID
+    const insideMatch = line.match(/^(\s*)([^\s]+)(\s+in\s+)([^\s]+)(\s*)$/i);
+    if(insideMatch){
+      const [, ws, child, kw, parent, trail] = insideMatch;
+      let html = escHtml(ws) + escHtml(child);
+      const childLabel = idLabelMap.get(child);
+      if(childLabel && childLabel !== child) html += `<span class="ghost-label"> ${escHtml(childLabel)}</span>`;
+      html += escHtml(kw) + escHtml(parent);
+      const parentLabel = idLabelMap.get(parent);
+      if(parentLabel && parentLabel !== parent) html += `<span class="ghost-label"> ${escHtml(parentLabel)}</span>`;
+      html += escHtml(trail);
+      return html;
+    }
+    // Partial: single token — might be a partial ID
+    const singleMatch = line.match(/^(\s*)([^\s]+)(\s*)$/);
+    if(singleMatch){
+      const [, ws, token, trail] = singleMatch;
+      let html = escHtml(ws) + escHtml(token);
+      const label = idLabelMap.get(token);
+      if(label && label !== token) html += `<span class="ghost-label"> ${escHtml(label)}</span>`;
+      html += escHtml(trail);
+      return html;
+    }
+    return escHtml(line);
+  }
+
+  // Decorate an annotated editor: rebuild innerHTML with ghost labels, preserve caret
+  function decorateEditor(el){
+    const sel = window.getSelection();
+    let caretOff = null;
+    if(sel.rangeCount && el.contains(sel.anchorNode)){
+      caretOff = getCaretOffset(el);
+    }
+
+    const raw = getEditorRawText(el);
+    const lines = raw.split('\n');
+    const idLabelMap = buildIdLabelMap();
+
+    let html = '';
+    for(let i = 0; i < lines.length; i++){
+      if(i > 0) html += '\n';
+      html += annotateLine(lines[i], idLabelMap);
+    }
+    el.innerHTML = html;
+
+    if(caretOff !== null){
+      setCaretOffset(el, caretOff);
+    }
+  }
+
+  // Set up a contenteditable div as an annotated editor with .value compatibility
+  function makeAnnotatedEditor(el){
+    Object.defineProperty(el, 'value', {
+      get(){ return getEditorRawText(el); },
+      set(v){
+        el.textContent = v;
+        decorateEditor(el);
+      }
+    });
+    // Paste: insert plain text only
+    el.addEventListener('paste', (e) => {
+      e.preventDefault();
+      const text = (e.clipboardData || window.clipboardData).getData('text/plain');
+      document.execCommand('insertText', false, text);
+    });
+    // Enter: insert newline (some browsers insert <div> instead)
+    el.addEventListener('keydown', (e) => {
+      if(e.key === 'Enter'){
+        e.preventDefault();
+        document.execCommand('insertText', false, '\n');
+      }
+    });
+  }
+
+  // Initialize annotated editors
+  makeAnnotatedEditor(insideTA);
+  makeAnnotatedEditor(connectorsTA);
+
+  // Set default content
+  insideTA.value = 'A2 in A3M\nS1 in A3M\nS2 in A2';
+  connectorsTA.value = 'H1 -> A1\nH2 -> A1\nA1 -> A2 : https\nA2 <-> S1 : jdbc';
+
+  // Measure text using a temporary SVG text element
+  function measureTextSVG(text, fontSize=14, fontFamily='Inter, Arial, sans-serif'){
+    const t = document.createElementNS('http://www.w3.org/2000/svg','text');
+    t.setAttribute('x','0'); t.setAttribute('y','0');
+    t.setAttribute('font-family', fontFamily);
+    t.setAttribute('font-size', String(fontSize));
+    t.textContent = text;
+    svg.appendChild(t);
+    const bbox = t.getBBox();
+    t.remove();
+    return { width: bbox.width, height: bbox.height };
+  }
+
+  // Grid layout constants
+  const GRID_COL_SPACING = 200;
+  const GRID_ROW_SPACING = 120;
+  const GRID_MARGIN_X = 100;
+  const GRID_MARGIN_Y = 60;
+  const BIDI_OFFSET = 7;
+
+  // Port-based system: get the midpoint of a specific side of a node
+  function nodePort(pos, kind, direction){
+    const cx = pos.x, cy = pos.y, w = pos.width, h = pos.height;
+    switch(direction){
+      case 'right':  return { x: cx + w/2, y: cy };
+      case 'left':   return { x: cx - w/2, y: cy };
+      case 'top':    return { x: cx, y: cy - h/2 };
+      case 'bottom': return { x: cx, y: cy + h/2 };
+    }
+  }
+
+  // Choose exit/entry ports based on relative position of two nodes
+  function selectPorts(srcPos, srcKind, dstPos, dstKind){
+    const dx = dstPos.x - srcPos.x;
+    const dy = dstPos.y - srcPos.y;
+    let srcDir, dstDir;
+    if(Math.abs(dx) >= Math.abs(dy)){
+      if(dx >= 0){ srcDir = 'right'; dstDir = 'left'; }
+      else { srcDir = 'left'; dstDir = 'right'; }
+    } else {
+      if(dy >= 0){ srcDir = 'bottom'; dstDir = 'top'; }
+      else { srcDir = 'top'; dstDir = 'bottom'; }
+    }
+    return {
+      srcPort: nodePort(srcPos, srcKind, srcDir),
+      dstPort: nodePort(dstPos, dstKind, dstDir),
+      srcDir, dstDir
+    };
+  }
+
+  // Count how many segments an orthogonal path would need for a given port pair
+  function countSegments(x1, y1, x2, y2, sDir, dDir){
+    const TOL = 5;
+    const isH = d => d === 'left' || d === 'right';
+    function ok(sx,sy,ex,ey,dir){
+      if(dir === 'right')  return Math.abs(ey - sy) < TOL && ex > sx + TOL;
+      if(dir === 'left')   return Math.abs(ey - sy) < TOL && ex < sx - TOL;
+      if(dir === 'bottom') return Math.abs(ex - sx) < TOL && ey > sy + TOL;
+      if(dir === 'top')    return Math.abs(ex - sx) < TOL && ey < sy - TOL;
+      return true;
+    }
+    // Straight
+    if(Math.abs(y1 - y2) < TOL || Math.abs(x1 - x2) < TOL){
+      if(ok(x1,y1,x2,y2,sDir) && ok(x2,y2,x1,y1,dDir)) return 1;
+    }
+    // L-shape
+    if(isH(sDir) !== isH(dDir)) return 2;
+    // S-shape or worse
+    return 3;
+  }
+
+  // Port-aware variant: picks ports that minimize arrow segments, using port usage as tiebreaker
+  function selectPortsAware(srcId, srcPos, srcKind, dstId, dstPos, dstKind, portUsage){
+    const dx = dstPos.x - srcPos.x;
+    const dy = dstPos.y - srcPos.y;
+
+    // Rank all 4 directions by how well they align with the vector to the other node
+    const dirs = ['right', 'left', 'top', 'bottom'];
+    const dirVec = { right:[1,0], left:[-1,0], top:[0,-1], bottom:[0,1] };
+
+    function rankDirs(toX, toY){
+      const len = Math.sqrt(toX*toX + toY*toY) || 1;
+      const nx = toX/len, ny = toY/len;
+      return dirs.slice().sort((a,b) => {
+        const da = dirVec[a], db = dirVec[b];
+        return (db[0]*nx + db[1]*ny) - (da[0]*nx + da[1]*ny);
+      });
+    }
+
+    const srcRanked = rankDirs(dx, dy);
+    const dstLen = Math.sqrt(dx*dx + dy*dy) || 1;
+    const dnx = -dx/dstLen, dny = -dy/dstLen;
+
+    // Evaluate top candidates for src and dst, pick pair minimizing segments
+    let bestSrc = srcRanked[0], bestDst = null, bestScore = Infinity;
+
+    for(const sd of srcRanked.slice(0, 3)){
+      // Rank dst directions given this srcDir
+      const sv2 = dirVec[sd];
+      const dstR = dirs.slice().sort((a,b) => {
+        const da = dirVec[a], db = dirVec[b];
+        const dotA = da[0]*dnx + da[1]*dny;
+        const dotB = db[0]*dnx + db[1]*dny;
+        if(Math.abs(dotA - dotB) > 0.001) return dotB - dotA;
+        const compA = da[0]*sv2[0] + da[1]*sv2[1];
+        const compB = db[0]*sv2[0] + db[1]*sv2[1];
+        return compB - compA;
+      });
+
+      for(const dd of dstR.slice(0, 3)){
+        const sp = nodePort(srcPos, srcKind, sd);
+        const dp = nodePort(dstPos, dstKind, dd);
+        const segments = countSegments(sp.x, sp.y, dp.x, dp.y, sd, dd);
+        const usage = ((portUsage[srcId]?.[sd]) || 0) + ((portUsage[dstId]?.[dd]) || 0);
+        const score = segments * 100 + usage;
+        if(score < bestScore){
+          bestScore = score;
+          bestSrc = sd;
+          bestDst = dd;
+        }
+      }
+    }
+
+    let srcDir = bestSrc;
+    let dstDir = bestDst || srcRanked[0];
+
+    // Record usage
+    if(portUsage[srcId]) portUsage[srcId][srcDir]++;
+    if(portUsage[dstId]) portUsage[dstId][dstDir]++;
+
+    return {
+      srcPort: nodePort(srcPos, srcKind, srcDir),
+      dstPort: nodePort(dstPos, dstKind, dstDir),
+      srcDir, dstDir
+    };
+  }
+
+  // Orthogonal path helpers — direction-aware routing
+  // Constraint: first segment must move in srcDir, last segment must approach from dstDir
+  function orthogonalPath(x1, y1, x2, y2, srcDir, dstDir){
+    const ALIGN_TOL = 5;
+    const CL = 30; // clearance distance for fallback routing
+    const isH = d => d === 'left' || d === 'right';
+    const dirVec = { right:[1,0], left:[-1,0], top:[0,-1], bottom:[0,1] };
+
+    // Check if first segment from (x1,y1) toward (nx,ny) respects srcDir
+    // Left/right ports require a horizontal first segment (same y, meaningful x movement)
+    // Top/bottom ports require a vertical first segment (same x, meaningful y movement)
+    function validFirst(nx, ny){
+      if(srcDir === 'right')  return Math.abs(ny - y1) < ALIGN_TOL && nx > x1 + ALIGN_TOL;
+      if(srcDir === 'left')   return Math.abs(ny - y1) < ALIGN_TOL && nx < x1 - ALIGN_TOL;
+      if(srcDir === 'bottom') return Math.abs(nx - x1) < ALIGN_TOL && ny > y1 + ALIGN_TOL;
+      if(srcDir === 'top')    return Math.abs(nx - x1) < ALIGN_TOL && ny < y1 - ALIGN_TOL;
+      return true;
+    }
+    // Check if last segment into (x2,y2) from (px,py) respects dstDir
+    function validLast(px, py){
+      if(dstDir === 'left')   return Math.abs(py - y2) < ALIGN_TOL && px < x2 - ALIGN_TOL;
+      if(dstDir === 'right')  return Math.abs(py - y2) < ALIGN_TOL && px > x2 + ALIGN_TOL;
+      if(dstDir === 'top')    return Math.abs(px - x2) < ALIGN_TOL && py < y2 - ALIGN_TOL;
+      if(dstDir === 'bottom') return Math.abs(px - x2) < ALIGN_TOL && py > y2 + ALIGN_TOL;
+      return true;
+    }
+
+    // Build path string from waypoints, removing collinear intermediates
+    function buildPath(pts){
+      if(pts.length <= 2) return `M ${pts[0][0]} ${pts[0][1]} L ${pts[1][0]} ${pts[1][1]}`;
+      const clean = [pts[0]];
+      for(let i = 1; i < pts.length - 1; i++){
+        const prev = clean[clean.length - 1], curr = pts[i], next = pts[i + 1];
+        const sameX = Math.abs(prev[0] - curr[0]) < 1 && Math.abs(curr[0] - next[0]) < 1;
+        const sameY = Math.abs(prev[1] - curr[1]) < 1 && Math.abs(curr[1] - next[1]) < 1;
+        if(!sameX && !sameY) clean.push(curr);
+      }
+      clean.push(pts[pts.length - 1]);
+      return 'M ' + clean.map(p => `${p[0]} ${p[1]}`).join(' L ');
+    }
+
+    // 1. Try straight line
+    if(Math.abs(y1 - y2) < ALIGN_TOL || Math.abs(x1 - x2) < ALIGN_TOL){
+      if(validFirst(x2, y2) && validLast(x1, y1)){
+        return `M ${x1} ${y1} L ${x2} ${y2}`;
+      }
+    }
+
+    const srcH = isH(srcDir), dstH = isH(dstDir);
+
+    // 2. Try L-shape (two options)
+    if(srcH !== dstH){
+      // Option A: horizontal first, then vertical
+      if(validFirst(x2, y1) && validLast(x2, y1)){
+        return buildPath([[x1,y1],[x2,y1],[x2,y2]]);
+      }
+      // Option B: vertical first, then horizontal
+      if(validFirst(x1, y2) && validLast(x1, y2)){
+        return buildPath([[x1,y1],[x1,y2],[x2,y2]]);
+      }
+    }
+
+    // 3. Try S-shape
+    if(srcH && dstH){
+      const midX = (x1 + x2) / 2;
+      if(validFirst(midX, y1) && validLast(midX, y2)){
+        return buildPath([[x1,y1],[midX,y1],[midX,y2],[x2,y2]]);
+      }
+    }
+    if(!srcH && !dstH){
+      const midY = (y1 + y2) / 2;
+      if(validFirst(x1, midY) && validLast(x2, midY)){
+        return buildPath([[x1,y1],[x1,midY],[x2,midY],[x2,y2]]);
+      }
+    }
+
+    // 4. Fallback: clearance-based routing (U-shape or multi-step)
+    const sv = dirVec[srcDir], ev = dirVec[dstDir];
+    const sx = x1 + sv[0] * CL, sy = y1 + sv[1] * CL;
+    const ex = x2 + ev[0] * CL, ey = y2 + ev[1] * CL;
+
+    // If extension points share an axis, connect directly
+    if(Math.abs(sx - ex) < ALIGN_TOL || Math.abs(sy - ey) < ALIGN_TOL){
+      return buildPath([[x1,y1],[sx,sy],[ex,ey],[x2,y2]]);
+    }
+
+    // Need one bend between extensions — turn perpendicular after src clearance
+    let bx, by;
+    if(isH(srcDir)){
+      bx = sx; by = ey; // go vertical after horizontal clearance
+    } else {
+      bx = ex; by = sy; // go horizontal after vertical clearance
+    }
+    return buildPath([[x1,y1],[sx,sy],[bx,by],[ex,ey],[x2,y2]]);
+  }
+
+  // Bidirectional: two parallel-offset orthogonal paths
+  // Computes waypoints using the same constraint-aware logic, then offsets per segment
+  function bidirectionalOrthogonalPaths(x1, y1, x2, y2, srcDir, dstDir, offset){
+    offset = offset || BIDI_OFFSET;
+    const ALIGN_TOL = 5;
+    const CL = 30;
+    const isH = d => d === 'left' || d === 'right';
+    const dirVec = { right:[1,0], left:[-1,0], top:[0,-1], bottom:[0,1] };
+
+    function validFirst(nx, ny){
+      if(srcDir === 'right')  return Math.abs(ny - y1) < ALIGN_TOL && nx > x1 + ALIGN_TOL;
+      if(srcDir === 'left')   return Math.abs(ny - y1) < ALIGN_TOL && nx < x1 - ALIGN_TOL;
+      if(srcDir === 'bottom') return Math.abs(nx - x1) < ALIGN_TOL && ny > y1 + ALIGN_TOL;
+      if(srcDir === 'top')    return Math.abs(nx - x1) < ALIGN_TOL && ny < y1 - ALIGN_TOL;
+      return true;
+    }
+    function validLast(px, py){
+      if(dstDir === 'left')   return Math.abs(py - y2) < ALIGN_TOL && px < x2 - ALIGN_TOL;
+      if(dstDir === 'right')  return Math.abs(py - y2) < ALIGN_TOL && px > x2 + ALIGN_TOL;
+      if(dstDir === 'top')    return Math.abs(px - x2) < ALIGN_TOL && py < y2 - ALIGN_TOL;
+      if(dstDir === 'bottom') return Math.abs(px - x2) < ALIGN_TOL && py > y2 + ALIGN_TOL;
+      return true;
+    }
+
+    // Compute waypoints using same priority as orthogonalPath
+    let pts = null;
+    const srcH = isH(srcDir), dstH = isH(dstDir);
+
+    // 1. Straight
+    if(Math.abs(y1 - y2) < ALIGN_TOL || Math.abs(x1 - x2) < ALIGN_TOL){
+      if(validFirst(x2, y2) && validLast(x1, y1)) pts = [[x1,y1],[x2,y2]];
+    }
+    // 2. L-shape
+    if(!pts && srcH !== dstH){
+      if(validFirst(x2, y1) && validLast(x2, y1)) pts = [[x1,y1],[x2,y1],[x2,y2]];
+      else if(validFirst(x1, y2) && validLast(x1, y2)) pts = [[x1,y1],[x1,y2],[x2,y2]];
+    }
+    // 3. S-shape
+    if(!pts && srcH && dstH){
+      const midX = (x1 + x2) / 2;
+      if(validFirst(midX, y1) && validLast(midX, y2)) pts = [[x1,y1],[midX,y1],[midX,y2],[x2,y2]];
+    }
+    if(!pts && !srcH && !dstH){
+      const midY = (y1 + y2) / 2;
+      if(validFirst(x1, midY) && validLast(x2, midY)) pts = [[x1,y1],[x1,midY],[x2,midY],[x2,y2]];
+    }
+    // 4. Clearance fallback
+    if(!pts){
+      const sv = dirVec[srcDir], ev = dirVec[dstDir];
+      const sx = x1 + sv[0] * CL, sy = y1 + sv[1] * CL;
+      const ex = x2 + ev[0] * CL, ey = y2 + ev[1] * CL;
+      if(Math.abs(sx - ex) < ALIGN_TOL || Math.abs(sy - ey) < ALIGN_TOL){
+        pts = [[x1,y1],[sx,sy],[ex,ey],[x2,y2]];
+      } else {
+        let bx, by;
+        if(isH(srcDir)){ bx = sx; by = ey; }
+        else { bx = ex; by = sy; }
+        pts = [[x1,y1],[sx,sy],[bx,by],[ex,ey],[x2,y2]];
+      }
+    }
+
+    // Remove collinear points
+    const clean = [pts[0]];
+    for(let i = 1; i < pts.length - 1; i++){
+      const prev = clean[clean.length - 1], curr = pts[i], next = pts[i + 1];
+      const sameX = Math.abs(prev[0] - curr[0]) < 1 && Math.abs(curr[0] - next[0]) < 1;
+      const sameY = Math.abs(prev[1] - curr[1]) < 1 && Math.abs(curr[1] - next[1]) < 1;
+      if(!sameX && !sameY) clean.push(curr);
+    }
+    clean.push(pts[pts.length - 1]);
+
+    // Apply perpendicular offsets per segment to create two parallel paths
+    function offsetPath(points, off){
+      const result = [];
+      for(let i = 0; i < points.length; i++){
+        let nx = 0, ny = 0;
+        if(i < points.length - 1){
+          const dx = points[i+1][0] - points[i][0];
+          const dy = points[i+1][1] - points[i][1];
+          // Perpendicular: rotate 90° CCW → (-dy, dx), normalized
+          const len = Math.sqrt(dx*dx + dy*dy) || 1;
+          nx = -dy / len; ny = dx / len;
+        } else {
+          const dx = points[i][0] - points[i-1][0];
+          const dy = points[i][1] - points[i-1][1];
+          const len = Math.sqrt(dx*dx + dy*dy) || 1;
+          nx = -dy / len; ny = dx / len;
+        }
+        result.push([points[i][0] + nx * off, points[i][1] + ny * off]);
+      }
+      return result;
+    }
+
+    const fwd = offsetPath(clean, offset);
+    const rev = offsetPath(clean, -offset);
+    const d1 = 'M ' + fwd.map(p => `${p[0]} ${p[1]}`).join(' L ');
+    const d2 = 'M ' + rev.reverse().map(p => `${p[0]} ${p[1]}`).join(' L ');
+    return [d1, d2];
+  }
+
+  function pointOnPathAtT(pathElem, t){
+    const len = pathElem.getTotalLength();
+    return pathElem.getPointAtLength(len * t);
+  }
+
+  // Layout: input-order grid with connector-driven swap optimization
+  function computeLayout(nodes, edges){
+    const n = nodes.length;
+    if(n === 0) return {};
+
+    const nodeMap = {};
+    for(const nd of nodes) nodeMap[nd.id] = nd;
+
+    // Build adjacency list from edges
+    const adj = {}; // id -> Set of connected ids
+    for(const nd of nodes) adj[nd.id] = new Set();
+    for(const e of edges){
+      if(adj[e.source]) adj[e.source].add(e.target);
+      if(adj[e.target]) adj[e.target].add(e.source);
+    }
+    // Unique undirected edge pairs for scoring
+    const edgePairs = [];
+    const seen = new Set();
+    for(const e of edges){
+      const key = [e.source, e.target].sort().join('|');
+      if(!seen.has(key)){ seen.add(key); edgePairs.push([e.source, e.target]); }
+    }
+
+    // Generous grid: allow gaps between nodes for straight arrows
+    let cols = Math.max(3, 2 * n - 1);
+    let rows = Math.max(3, 2 * n - 1);
+
+    // Initialize grid: place nodes in input order, left-to-right, top-to-bottom
+    // grid[row][col] = node id or null
+    const grid = [];
+    for(let r = 0; r < rows; r++){
+      grid.push(new Array(cols).fill(null));
+    }
+    // pos[id] = {row, col}
+    const pos = {};
+    for(let i = 0; i < n; i++){
+      const r = Math.floor(i / cols), c = i % cols;
+      grid[r][c] = nodes[i].id;
+      pos[nodes[i].id] = { row: r, col: c };
+    }
+
+    // Score: count arrow steps for each edge (lower is better)
+    // straight=1, L-shape=2, blocked/S/U=3
+    function edgeSteps(a, b){
+      const pa = pos[a], pb = pos[b];
+      if(!pa || !pb) return 4;
+      if(pa.row === pb.row){
+        const minC = Math.min(pa.col, pb.col), maxC = Math.max(pa.col, pb.col);
+        for(let c = minC + 1; c < maxC; c++) if(grid[pa.row][c]) return 3;
+        return 1;
+      }
+      if(pa.col === pb.col){
+        const minR = Math.min(pa.row, pb.row), maxR = Math.max(pa.row, pb.row);
+        for(let r = minR + 1; r < maxR; r++) if(grid[r][pa.col]) return 3;
+        return 1;
+      }
+      // Diagonal = L-shape; check if at least one corner is clear
+      const c1 = grid[pa.row]?.[pb.col], c2 = grid[pb.row]?.[pa.col];
+      if(!c1 || c1 === a || c1 === b) return 2;
+      if(!c2 || c2 === a || c2 === b) return 2;
+      return 3;
+    }
+    function totalArrowSteps(){
+      let sum = 0;
+      for(const [a, b] of edgePairs) sum += edgeSteps(a, b);
+      return sum;
+    }
+
+    // Try placing hub node at center with neighbors on cardinal positions
+    function tryHubPlacement(){
+      let hubId = null, hubDeg = 0;
+      for(const nd of nodes){
+        if(adj[nd.id].size > hubDeg){ hubDeg = adj[nd.id].size; hubId = nd.id; }
+      }
+      if(!hubId || hubDeg < 2) return false;
+
+      const centerR = Math.floor(rows / 2), centerC = Math.floor(cols / 2);
+      const cardinals = [
+        { r: centerR, c: centerC - 1 },
+        { r: centerR, c: centerC + 1 },
+        { r: centerR - 1, c: centerC },
+        { r: centerR + 1, c: centerC }
+      ].filter(p => p.r >= 0 && p.r < rows && p.c >= 0 && p.c < cols);
+
+      const neighbors = Array.from(adj[hubId]);
+      if(neighbors.length > cardinals.length) return false;
+
+      // Save current state
+      const savedGrid = grid.map(r => [...r]);
+      const savedPos = {};
+      for(const k in pos) savedPos[k] = { ...pos[k] };
+      const scoreBefore = totalArrowSteps();
+
+      // Clear all involved positions
+      const involved = [hubId, ...neighbors];
+      for(const id of involved){
+        if(pos[id]) grid[pos[id].row][pos[id].col] = null;
+      }
+
+      // Place hub at center
+      const displaced = grid[centerR][centerC];
+      if(displaced && !involved.includes(displaced)){
+        const empty = findEmpty();
+        if(empty){
+          grid[empty.r][empty.c] = displaced;
+          pos[displaced] = { row: empty.r, col: empty.c };
+        } else {
+          for(let r = 0; r < rows; r++) for(let c = 0; c < cols; c++) grid[r][c] = savedGrid[r][c];
+          for(const k in savedPos) pos[k] = savedPos[k];
+          return false;
+        }
+      }
+      grid[centerR][centerC] = hubId;
+      pos[hubId] = { row: centerR, col: centerC };
+
+      // Try all permutations of neighbor→cardinal assignment, keep best
+      function permutations(arr){
+        if(arr.length <= 1) return [arr];
+        const result = [];
+        for(let i = 0; i < arr.length; i++){
+          const rest = [...arr.slice(0,i), ...arr.slice(i+1)];
+          for(const p of permutations(rest)) result.push([arr[i], ...p]);
+        }
+        return result;
+      }
+
+      let bestPerm = null, bestPermScore = Infinity;
+      const hubGrid = grid.map(r => [...r]);
+      const hubPos = {};
+      for(const k in pos) hubPos[k] = { ...pos[k] };
+
+      for(const perm of permutations(neighbors)){
+        for(let r = 0; r < rows; r++) for(let c = 0; c < cols; c++) grid[r][c] = hubGrid[r][c];
+        for(const k in hubPos) pos[k] = { ...hubPos[k] };
+
+        let valid = true;
+        for(let i = 0; i < perm.length; i++){
+          const nid = perm[i];
+          const card = cardinals[i];
+          const prev = grid[card.r][card.c];
+          if(prev && prev !== nid && !involved.includes(prev)){
+            const empty = findEmpty();
+            if(empty){ grid[empty.r][empty.c] = prev; pos[prev] = { row: empty.r, col: empty.c }; }
+            else { valid = false; break; }
+          }
+          grid[card.r][card.c] = nid;
+          pos[nid] = { row: card.r, col: card.c };
+        }
+        if(!valid) continue;
+        const s = totalArrowSteps();
+        if(s < bestPermScore){ bestPermScore = s; bestPerm = perm.slice(); }
+      }
+
+      // Apply best permutation
+      if(bestPerm){
+        for(let r = 0; r < rows; r++) for(let c = 0; c < cols; c++) grid[r][c] = hubGrid[r][c];
+        for(const k in hubPos) pos[k] = { ...hubPos[k] };
+        for(let i = 0; i < bestPerm.length; i++){
+          const nid = bestPerm[i];
+          const card = cardinals[i];
+          const prev = grid[card.r][card.c];
+          if(prev && prev !== nid && !involved.includes(prev)){
+            const empty = findEmpty();
+            if(empty){ grid[empty.r][empty.c] = prev; pos[prev] = { row: empty.r, col: empty.c }; }
+          }
+          grid[card.r][card.c] = nid;
+          pos[nid] = { row: card.r, col: card.c };
+        }
+      }
+
+      const scoreAfter = totalArrowSteps();
+      if(scoreAfter <= scoreBefore){
+        return true;
+      }
+      // Restore
+      for(let r = 0; r < rows; r++) for(let c = 0; c < cols; c++) grid[r][c] = savedGrid[r][c];
+      for(const k in savedPos) pos[k] = savedPos[k];
+      for(const k of Object.keys(pos)){ if(!(k in savedPos)) delete pos[k]; }
+      return false;
+    }
+
+    function findEmpty(){
+      for(let r = 0; r < rows; r++){
+        for(let c = 0; c < cols; c++){
+          if(!grid[r][c]) return { r, c };
+        }
+      }
+      return null;
+    }
+
+    // Swap helpers
+    let _swapSaved = null;
+    function doSwap(id, targetR, targetC){
+      const src = pos[id];
+      const occupant = grid[targetR][targetC];
+      _swapSaved = { id, srcR: src.row, srcC: src.col, occupant, targetR, targetC };
+      grid[src.row][src.col] = occupant;
+      grid[targetR][targetC] = id;
+      pos[id] = { row: targetR, col: targetC };
+      if(occupant) pos[occupant] = { row: src.row, col: src.col };
+    }
+    function undoSwap(){
+      if(!_swapSaved) return;
+      const { id, srcR, srcC, occupant, targetR, targetC } = _swapSaved;
+      grid[targetR][targetC] = occupant;
+      grid[srcR][srcC] = id;
+      pos[id] = { row: srcR, col: srcC };
+      if(occupant) pos[occupant] = { row: targetR, col: targetC };
+      _swapSaved = null;
+    }
+
+    // Swap optimization: minimize total arrow steps
+    function swapOptimize(){
+      let improved = true;
+      let passes = 0;
+      while(improved && passes < 30){
+        improved = false;
+        passes++;
+        const scoreBefore = totalArrowSteps();
+
+        for(const [a, b] of edgePairs){
+          const pa = pos[a], pb = pos[b];
+          if(!pa || !pb) continue;
+          if(edgeSteps(a, b) <= 1) continue; // already optimal
+
+          let bestSwap = null, bestScore = totalArrowSteps();
+
+          // Try moving b to same row as a (all cols including empty)
+          for(let c = 0; c < cols; c++){
+            if(c === pa.col) continue;
+            const occupant = grid[pa.row][c];
+            if(occupant === b) continue;
+            doSwap(b, pa.row, c);
+            const s = totalArrowSteps();
+            if(s < bestScore){ bestScore = s; bestSwap = { id: b, r: pa.row, c }; }
+            undoSwap();
+          }
+          // Try moving b to same col as a
+          for(let r = 0; r < rows; r++){
+            if(r === pa.row) continue;
+            const occupant = grid[r][pa.col];
+            if(occupant === b) continue;
+            doSwap(b, r, pa.col);
+            const s = totalArrowSteps();
+            if(s < bestScore){ bestScore = s; bestSwap = { id: b, r, c: pa.col }; }
+            undoSwap();
+          }
+          // Try moving a to same row as b
+          for(let c = 0; c < cols; c++){
+            if(c === pb.col) continue;
+            const occupant = grid[pb.row][c];
+            if(occupant === a) continue;
+            doSwap(a, pb.row, c);
+            const s = totalArrowSteps();
+            if(s < bestScore){ bestScore = s; bestSwap = { id: a, r: pb.row, c }; }
+            undoSwap();
+          }
+          // Try moving a to same col as b
+          for(let r = 0; r < rows; r++){
+            if(r === pb.row) continue;
+            const occupant = grid[r][pb.col];
+            if(occupant === a) continue;
+            doSwap(a, r, pb.col);
+            const s = totalArrowSteps();
+            if(s < bestScore){ bestScore = s; bestSwap = { id: a, r, c: pb.col }; }
+            undoSwap();
+          }
+
+          if(bestSwap && bestScore < totalArrowSteps()){
+            doSwap(bestSwap.id, bestSwap.r, bestSwap.c);
+            _swapSaved = null; // commit
+            improved = true;
+          }
+        }
+      }
+    }
+
+    // Run optimization
+    if(edgePairs.length > 0){
+      tryHubPlacement();
+      swapOptimize();
+    }
+
+    // Trim empty columns
+    for(let c = cols - 1; c >= 0; c--){
+      let empty = true;
+      for(let r = 0; r < rows; r++) if(grid[r][c]){ empty = false; break; }
+      if(!empty) continue;
+      for(let r = 0; r < rows; r++) grid[r].splice(c, 1);
+      cols--;
+      for(const id in pos) if(pos[id].col > c) pos[id].col--;
+    }
+    // Trim empty rows
+    for(let r = rows - 1; r >= 0; r--){
+      let empty = true;
+      for(let c = 0; c < cols; c++) if(grid[r][c]){ empty = false; break; }
+      if(!empty) continue;
+      grid.splice(r, 1);
+      rows--;
+      for(const id in pos) if(pos[id].row > r) pos[id].row--;
+    }
+
+    // Compute max width per column and max height per row
+    const colWidths = new Array(cols).fill(80);
+    const rowHeights = new Array(rows).fill(30);
+    for(let r = 0; r < rows; r++){
+      for(let c = 0; c < cols; c++){
+        const id = grid[r][c];
+        if(!id) continue;
+        const nd = nodeMap[id];
+        if(nd){
+          colWidths[c] = Math.max(colWidths[c], nd.width);
+          rowHeights[r] = Math.max(rowHeights[r], nd.height);
+        }
+      }
+    }
+
+    // Compute pixel positions
+    const res = {};
+    for(const nd of nodes){
+      const p = pos[nd.id];
+      if(!p) continue;
+      // Cumulative x: sum of previous column widths + spacing
+      let px = GRID_MARGIN_X;
+      for(let c = 0; c < p.col; c++) px += colWidths[c] + GRID_COL_SPACING;
+      px += colWidths[p.col] / 2;
+
+      let py = GRID_MARGIN_Y;
+      for(let r = 0; r < p.row; r++) py += rowHeights[r] + GRID_ROW_SPACING;
+      py += rowHeights[p.row] / 2;
+
+      res[nd.id] = { x: px, y: py, width: nd.width, height: nd.height };
+    }
+    return res;
+  }
+
+  // Helpers to create DOM SVG elements
+  function svgEl(tag, attrs = {}) {
+    const el = document.createElementNS('http://www.w3.org/2000/svg', tag);
+    for(const k in attrs) {
+      el.setAttribute(k, String(attrs[k]));
+    }
+    return el;
+  }
+
+  // Main render
+  function render(){
+    // parse inputs
+    const assetsLines = parseLines(assetsTA.value);
+    const storageLines = parseLines(storagesTA.value);
+    const connectorLines = parseLines(connectorsTA.value);
+
+    const errors = [];
+    const assetMap = new Map();
+    const storageMap = new Map();
+
+    const assets = [];
+    const storages = [];
+
+    for(const l of assetsLines){
+      const p = parseIdLabel(l);
+      if(!p){ errors.push('Invalid asset line: ' + l); continue; }
+      if(assetMap.has(p.id)){ errors.push('Duplicate asset id: ' + p.id); continue; }
+      assetMap.set(p.id, p);
+      assets.push(p);
+    }
+    for(const l of storageLines){
+      const p = parseIdLabel(l);
+      if(!p){ errors.push('Invalid storage line: ' + l); continue; }
+      if(storageMap.has(p.id)){ errors.push('Duplicate storage id: ' + p.id); continue; }
+      storageMap.set(p.id, p);
+      storages.push(p);
+    }
+
+    // parse Inside lines (child in parent)
+    const insideLines = parseLines(insideTA && insideTA.value ? insideTA.value : '');
+    insidePairs = parseInside(insideLines);
+
+    // Unified parsing: classify each connector line as connector (asset↔asset) or flow (asset↔storage)
+    const validConnectors = [];
+    const validFlows = [];
+    for(const l of connectorLines){
+      const m = l.match(/^([^<\-\s]+)\s*(<->|->|<-)\s*([^:\s]+)(?:\s*:\s*(.*))?$/);
+      if(!m) continue;
+      const left = m[1].trim(), arrow = m[2], right = m[3].trim(), label = (m[4]||'').trim();
+      const leftIsAsset = assetMap.has(left), rightIsAsset = assetMap.has(right);
+      const leftIsStorage = storageMap.has(left), rightIsStorage = storageMap.has(right);
+
+      if(leftIsAsset && rightIsAsset){
+        let a = left, b = right, bidi = arrow === '<->';
+        if(arrow === '<-'){ a = right; b = left; }
+        validConnectors.push({ a, b, bidi, label });
+      } else if((leftIsAsset && rightIsStorage) || (leftIsStorage && rightIsAsset)){
+        validFlows.push({ left, arrow, right, label });
+      } else {
+        errors.push(`Unknown endpoints: ${left} or ${right}`);
+      }
+    }
+
+    // Build nodes array with measured sizes
+    const nodes = [];
+    for(const a of assets){
+      const m = measureTextSVG(a.label, 14);
+      let w = Math.max(80, m.width + 24);
+      const h = Math.max(30, m.height + 14);
+      // detect human assets (id starts with H, case-insensitive)
+      const isHuman = typeof a.id === 'string' && /^h/i.test(a.id);
+      let iconWidth = 0;
+      if(isHuman){
+        // reserve space for an inline human glyph (scaled by height)
+        const iconH = Math.min(36, h - 12);
+        iconWidth = Math.round(iconH * 0.7);
+        // add small padding between icon and label
+        w = Math.max(w, m.width + 24 + iconWidth + 8);
+      }
+      const isMultiple = typeof a.id === 'string' && a.id.length >= 2 && /m$/i.test(a.id);
+      nodes.push({ id: a.id, label: a.label, kind: 'asset', width: w, height: h, human: isHuman, iconWidth, multiple: isMultiple });
+    }
+    for(const s of storages){
+      const m = measureTextSVG(s.label, 14);
+      const w = Math.max(80, m.width + 24);
+      const h = Math.max(30, m.height + 14);
+      const isMultiple = typeof s.id === 'string' && s.id.length >= 2 && /m$/i.test(s.id);
+      nodes.push({ id: s.id, label: s.label, kind: 'storage', width: w, height: h, multiple: isMultiple });
+    }
+
+    // process inside pairs: validate and build maps, then auto-resize parents to fit children
+    const nodeById = {};
+    for(const n of nodes) nodeById[n.id] = n;
+    const insideMap = new Map(); // parent -> [child...]
+    const childParent = new Map();
+    if(insidePairs && insidePairs.length){
+      for(const ip of insidePairs){
+        const child = ip.child, parent = ip.parent;
+        if(!nodeById[child]){ errors.push('Inside references unknown child: ' + child); continue; }
+        if(!nodeById[parent]){ errors.push('Inside references unknown parent: ' + parent); continue; }
+        if(childParent.has(child)){ errors.push('Child referenced in multiple Inside constraints: ' + child); continue; }
+        childParent.set(child, parent);
+        if(!insideMap.has(parent)) insideMap.set(parent, []);
+        insideMap.get(parent).push(child);
+      }
+      // detect cycles
+      function detectCycles(map){
+        const temp = new Set(), perm = new Set();
+        const bad = [];
+        function visit(n, path){
+          if(perm.has(n)) return false;
+          if(temp.has(n)){ bad.push([...path, n]); return true; }
+          temp.add(n);
+          const ch = map.get(n) || [];
+          for(const c of ch) if(visit(c, [...path, n])) return true;
+          temp.delete(n);
+          perm.add(n);
+          return false;
+        }
+        for(const k of map.keys()){ if(visit(k, [])) break; }
+        return bad;
+      }
+      const cycles = detectCycles(insideMap);
+      if(cycles.length){
+        for(const cyc of cycles) errors.push('Inside cycle detected: ' + cyc.join(' -> '));
+        insideMap.clear();
+        childParent.clear();
+      }
+    }
+
+    // auto-resize parents to fit children (deterministic, bottom-up)
+    const padLeft = 12, padRight = 12, padTop = 12, padBottom = 12, labelPadX = 8, labelPadY = 6, spacingY = 30;
+
+    // Build a deterministic childrenMap from insideMap
+    const childrenMap = new Map();
+    if(insideMap && insideMap.size){
+      for(const [p, chs] of insideMap.entries()){
+        childrenMap.set(p, Array.from(chs));
+      }
+    }
+
+    // Compute containment depths using BFS from roots (order-independent)
+    // depthMap will store depth per node (0 = outermost)
+    const depthMap = new Map();
+    if(childrenMap.size){
+      const allChildren = new Set();
+      for(const chs of childrenMap.values()) for(const c of chs) allChildren.add(c);
+      const roots = [];
+      for(const n of nodes) if(!allChildren.has(n.id)) roots.push(n.id);
+      const q = [];
+      for(const r of roots){ depthMap.set(r, 0); q.push(r); }
+      while(q.length){
+        const cur = q.shift();
+        const d = depthMap.get(cur) || 0;
+        const chs = childrenMap.get(cur) || [];
+        for(const c of chs){
+          if(!depthMap.has(c)){
+            depthMap.set(c, d + 1);
+            q.push(c);
+          }
+        }
+      }
+      // any parents not reached assign depth 0
+      for(const p of childrenMap.keys()) if(!depthMap.has(p)) depthMap.set(p, 0);
+    }
+
+    // Auto-resize parents bottom-up (innermost first) so outer parents account for inner sizes
+    if(childrenMap.size){
+      const parentsByDepthDesc = Array.from(childrenMap.keys()).sort((a,b) => (depthMap.get(b) || 0) - (depthMap.get(a) || 0));
+      for(const parent of parentsByDepthDesc){
+        const parentNode = nodeById[parent];
+        if(!parentNode) continue;
+        const children = childrenMap.get(parent) || [];
+        let maxChildW = 0, totalChildH = 0;
+        for(const cid of children){
+          const cn = nodeById[cid];
+          if(!cn) continue;
+          maxChildW = Math.max(maxChildW, cn.width);
+          totalChildH += cn.height + spacingY;
+        }
+        if(totalChildH > 0) totalChildH -= spacingY;
+        const labelM = measureTextSVG(parentNode.label, 14);
+        const neededW = Math.max(parentNode.width, maxChildW + padLeft + padRight);
+        const neededH = Math.max(parentNode.height, labelM.height + labelPadY + padTop + padBottom + totalChildH);
+        if(neededW > parentNode.width) parentNode.width = neededW;
+        if(neededH > parentNode.height) parentNode.height = neededH;
+      }
+    }
+
+    // Edges for layout
+    const edgesForLayout = [];
+    let ec = 0;
+    for(const c of validConnectors){
+      edgesForLayout.push({ id: 'e'+(ec++), source: c.a, target: c.b });
+      if(c.bidi) edgesForLayout.push({ id: 'e'+(ec++), source: c.b, target: c.a });
+    }
+    for(const f of validFlows){
+      let assetId, storageId;
+      if(assetMap.has(f.left)){ assetId = f.left; storageId = f.right; }
+      else { assetId = f.right; storageId = f.left; }
+      edgesForLayout.push({ id: 'e'+(ec++), source: assetId, target: storageId });
+      if(f.arrow === '<->' || f.type === 'read-write') edgesForLayout.push({ id: 'e'+(ec++), source: storageId, target: assetId });
+    }
+
+    // compute layout positions — exclude child nodes (they're positioned inside parents later)
+    const gridNodes = nodes.filter(n => !childParent.has(n.id));
+    // Find top-level ancestor for a child node
+    function topAncestor(id){
+      let cur = id;
+      while(childParent.has(cur)) cur = childParent.get(cur);
+      return cur;
+    }
+    // Remap edges: if an endpoint is a child, replace with its top-level ancestor
+    // Then filter out self-loops and deduplicate
+    const gridEdgeSet = new Set();
+    const gridEdges = [];
+    for(const e of edgesForLayout){
+      const src = childParent.has(e.source) ? topAncestor(e.source) : e.source;
+      const tgt = childParent.has(e.target) ? topAncestor(e.target) : e.target;
+      if(src === tgt) continue; // self-loop (both inside same parent)
+      const key = src + '|' + tgt;
+      if(gridEdgeSet.has(key)) continue;
+      gridEdgeSet.add(key);
+      gridEdges.push({ id: e.id, source: src, target: tgt });
+    }
+    const positions = computeLayout(gridNodes, gridEdges);
+
+    // after layout, position children inside parents (override layout positions)
+    if(typeof insideMap !== 'undefined' && insideMap && insideMap.size){
+      for(const [parent, children] of insideMap.entries()){
+        const p = positions[parent];
+        if(!p) continue;
+        const parentNode = nodeById[parent];
+        const left = p.x - p.width/2;
+        const top = p.y - p.height/2;
+        const labelM = measureTextSVG(parentNode.label, 14);
+        let curY = top + labelM.height + labelPadY + padTop;
+          // Sort: children without external connections first (top), externally-connected last (bottom)
+          const childSet = new Set(children);
+          const sorted = children.slice().sort((a, b) => {
+            const aExt = edgesForLayout.some(e =>
+              (e.source === a && !childSet.has(e.target) && e.target !== parent) ||
+              (e.target === a && !childSet.has(e.source) && e.source !== parent));
+            const bExt = edgesForLayout.some(e =>
+              (e.source === b && !childSet.has(e.target) && e.target !== parent) ||
+              (e.target === b && !childSet.has(e.source) && e.source !== parent));
+            return (aExt ? 1 : 0) - (bExt ? 1 : 0);
+          });
+          for(const cid of sorted){
+            const cn = nodeById[cid];
+            if(!cn) continue;
+            const childX = p.x;
+            const childY = curY + cn.height/2;
+            positions[cid] = { x: childX, y: childY, width: cn.width, height: cn.height };
+            curY += cn.height + spacingY;
+          }
+      }
+    }
+
+    // helper: collision detection & safe-point selection for labels/decorations
+    // NOTE: these helpers use `positions` which is defined above (node center + size)
+    function isPointInsideAnyNode(pt, positions, excludeIds){
+      for(const id in positions){
+        if(excludeIds && excludeIds.includes(id)) continue;
+        const p = positions[id];
+        const left = p.x - p.width/2, top = p.y - p.height/2, right = p.x + p.width/2, bottom = p.y + p.height/2;
+        if(pt.x >= left && pt.x <= right && pt.y >= top && pt.y <= bottom) return true;
+      }
+      return false;
+    }
+
+    function findSafePointOnPath(pathElem, positions, excludeIds){
+      // try several sample points starting at midpoint and moving outward
+      const ts = [0.5];
+      for(let d=1; d<=10; d++){
+        ts.push(Math.min(0.98, 0.5 + d*0.05));
+        ts.push(Math.max(0.02, 0.5 - d*0.05));
+      }
+      for(const t of ts){
+        try{
+          const pt = pointOnPathAtT(pathElem, t);
+          if(!isPointInsideAnyNode(pt, positions, excludeIds)) return pt;
+        }catch(e){
+          // ignore and continue
+        }
+      }
+      // fallback to midpoint if nothing else
+      return pointOnPathAtT(pathElem, 0.5);
+    }
+
+    // Draw TAM-style connector decoration: circle + arrowhead + label near destination
+    // If bidi=true, draws a second arrowhead pointing in the reverse direction
+    function drawConnectorDecor(pathElem, label, decorG, positions, excludeIds, bidi){
+      const len = pathElem.getTotalLength();
+      if(len < 1) return;
+
+      // Find a point near the destination end (t≈0.75), avoiding nodes
+      let t = 0.75;
+      for(const tt of [0.75, 0.70, 0.65, 0.80, 0.85]){
+        const pt = pathElem.getPointAtLength(len * tt);
+        if(!isPointInsideAnyNode(pt, positions, excludeIds)){ t = tt; break; }
+      }
+      const cp = pathElem.getPointAtLength(len * t);
+
+      // Compute path direction (tangent) at that point
+      const delta = Math.max(1, len * 0.02);
+      const pBefore = pathElem.getPointAtLength(Math.max(0, len * t - delta));
+      const pAfter = pathElem.getPointAtLength(Math.min(len, len * t + delta));
+      const dx = pAfter.x - pBefore.x, dy = pAfter.y - pBefore.y;
+      const dlen = Math.sqrt(dx*dx + dy*dy) || 1;
+      const ux = dx/dlen, uy = dy/dlen; // unit tangent (toward destination)
+      const px = -uy, py = ux; // perpendicular (to the right of path direction)
+
+      const circR = 5;
+      const ahLen = 7;
+      const ahHalf = 4;
+
+      // Forward arrowhead: ahead of circle, pointing toward destination
+      const fwdDist = circR + 3;
+      const fwdBase = { x: cp.x + ux * fwdDist, y: cp.y + uy * fwdDist };
+      const fwdTip = { x: fwdBase.x + ux * ahLen, y: fwdBase.y + uy * ahLen };
+      const fwdL = { x: fwdBase.x + px * ahHalf, y: fwdBase.y + py * ahHalf };
+      const fwdR = { x: fwdBase.x - px * ahHalf, y: fwdBase.y - py * ahHalf };
+      const fwdArrow = svgEl('polygon', {
+        points: `${fwdTip.x},${fwdTip.y} ${fwdL.x},${fwdL.y} ${fwdR.x},${fwdR.y}`,
+        fill:'#333'
+      });
+      decorG.appendChild(fwdArrow);
+
+      // Reverse arrowhead (bidi only): behind circle, pointing toward source
+      if(bidi){
+        const revDist = circR + 3;
+        const revBase = { x: cp.x - ux * revDist, y: cp.y - uy * revDist };
+        const revTip = { x: revBase.x - ux * ahLen, y: revBase.y - uy * ahLen };
+        const revL = { x: revBase.x + px * ahHalf, y: revBase.y + py * ahHalf };
+        const revR = { x: revBase.x - px * ahHalf, y: revBase.y - py * ahHalf };
+        const revArrow = svgEl('polygon', {
+          points: `${revTip.x},${revTip.y} ${revL.x},${revL.y} ${revR.x},${revR.y}`,
+          fill:'#333'
+        });
+        decorG.appendChild(revArrow);
+      }
+
+      // Circle: drawn on top of arrowheads
+      const circle = svgEl('circle', { cx: cp.x, cy: cp.y, r: circR, fill:'#fff', stroke:'#333', 'stroke-width':1.5 });
+      decorG.appendChild(circle);
+
+      // Label: positioned to the right of the circle (perpendicular to path)
+      if(label){
+        const lblOff = circR + 4;
+        const lx = cp.x + px * lblOff;
+        const ly = cp.y + py * lblOff + 4; // +4 for text baseline
+        const textEl = svgEl('text', { x: lx, y: ly, 'text-anchor':'start', 'font-size':11, 'font-family':'Inter, Arial, sans-serif', fill:'#333', 'font-weight':'bold', opacity:0.7 });
+        textEl.textContent = label;
+        decorG.appendChild(textEl);
+      }
+    }
+
+    // clear groups
+    nodesG.innerHTML = '';
+    edgesG.innerHTML = '';
+    decorG.innerHTML = '';
+
+    // Map kinds for intersection decisions
+    const kindMap = {};
+    for (const n of nodes) kindMap[n.id] = n.kind;
+
+    // Draw nodes grouped by depth (deepest first so shallower nodes render on top)
+    // We collect nodes by depth here; actual drawing happens later so we can control z-order.
+    const parentSet = new Set();
+    if(typeof insideMap !== 'undefined' && insideMap && insideMap.size){
+      for(const [parent, children] of insideMap.entries()) parentSet.add(parent);
+    }
+
+    // collect nodes by depth (default depth 0)
+    const nodesByDepth = new Map();
+    let maxDepth = 0;
+    for(const n of nodes){
+      const d = (depthMap && depthMap.has(n.id)) ? depthMap.get(n.id) : 0;
+      if(d > maxDepth) maxDepth = d;
+      if(!nodesByDepth.has(d)) nodesByDepth.set(d, []);
+      nodesByDepth.get(d).push(n);
+    }
+
+    // Track used ports per node to avoid overlapping arrows
+    const portUsage = {};
+    for(const n of nodes) portUsage[n.id] = { top: 0, bottom: 0, left: 0, right: 0 };
+
+    // Draw connectors (asset-asset) using orthogonal routing with TAM-style decorations
+    for(const c of validConnectors){
+      const pa = positions[c.a], pb = positions[c.b];
+      if(!pa || !pb) continue;
+      const { srcPort: p1, dstPort: p2, srcDir, dstDir } = selectPortsAware(c.a, pa, 'asset', c.b, pb, 'asset', portUsage);
+
+      if(c.bidi){
+        // single path with decoration showing arrowheads in both directions
+        const d = orthogonalPath(p1.x, p1.y, p2.x, p2.y, srcDir, dstDir);
+        const path = svgEl('path', { d, stroke:'#333', 'stroke-width':1.5, fill:'none' });
+        edgesG.appendChild(path);
+        try{ drawConnectorDecor(path, c.label || null, decorG, positions, [c.a, c.b], true); }catch(e){}
+      } else {
+        const d = orthogonalPath(p1.x, p1.y, p2.x, p2.y, srcDir, dstDir);
+        const path = svgEl('path', { d, stroke:'#333', 'stroke-width':1.5, fill:'none' });
+        edgesG.appendChild(path);
+        try{ drawConnectorDecor(path, c.label || null, decorG, positions, [c.a, c.b]); }catch(e){}
+      }
+    }
+
+    // Draw flows (asset-storage) using orthogonal routing
+    for(const f of validFlows){
+      // determine asset vs storage sides
+      let assetId, storageId;
+      if(kindMap[f.left] === 'asset' && kindMap[f.right] === 'storage'){
+        assetId = f.left; storageId = f.right;
+      } else if(kindMap[f.right] === 'asset' && kindMap[f.left] === 'storage'){
+        assetId = f.right; storageId = f.left;
+      } else {
+        continue;
+      }
+      const pa = positions[assetId], ps = positions[storageId];
+      if(!pa || !ps) continue;
+
+      // Use port-based routing
+      const { srcPort: pFrom, dstPort: pTo, srcDir, dstDir } = selectPortsAware(assetId, pa, 'asset', storageId, ps, 'storage', portUsage);
+
+      if(f.arrow === '<->'){
+        // Bidirectional: two cubic Bézier arcs respecting port directions
+        const dirVec = { right:[1,0], left:[-1,0], top:[0,-1], bottom:[0,1] };
+        const sv = dirVec[srcDir], dv = dirVec[dstDir];
+        const ddx = pTo.x - pFrom.x, ddy = pTo.y - pFrom.y;
+        const dist = Math.sqrt(ddx*ddx + ddy*ddy) || 1;
+        const pull = dist * 0.4;
+        const spread = Math.min(20, dist * 0.15);
+        const spx = -sv[1], spy = sv[0];
+        let firstPath = null;
+        for(const sign of [1, -1]){
+          const c1x = pFrom.x + sv[0] * pull + spx * spread * sign;
+          const c1y = pFrom.y + sv[1] * pull + spy * spread * sign;
+          const c2x = pTo.x + dv[0] * pull + spx * spread * sign;
+          const c2y = pTo.y + dv[1] * pull + spy * spread * sign;
+          let d;
+          if(sign === 1){
+            d = `M ${pFrom.x} ${pFrom.y} C ${c1x} ${c1y} ${c2x} ${c2y} ${pTo.x} ${pTo.y}`;
+          } else {
+            d = `M ${pTo.x} ${pTo.y} C ${c2x} ${c2y} ${c1x} ${c1y} ${pFrom.x} ${pFrom.y}`;
+          }
+          const path = svgEl('path', { d, stroke:'#333', 'stroke-width':1.5, fill:'none', 'marker-end':'url(#arrow-small)' });
+          edgesG.appendChild(path);
+          if(!firstPath) firstPath = path;
+        }
+
+        // optional label
+        if(f.label){
+          try{
+            const lbl = f.label;
+            const pos = findSafePointOnPath(firstPath, positions, [assetId, storageId]);
+            const m = measureTextSVG(lbl, 11);
+            const padX = 8, padY = 4;
+            const rect = svgEl('rect', { x: pos.x - (m.width/2) - padX, y: pos.y - (m.height/2) - padY, width: m.width + padX*2, height: m.height + padY*2, rx:4, fill:'#fff', stroke:'#e6e6e6', opacity:0.85 });
+            const textEl = svgEl('text', { x: pos.x, y: pos.y + (m.height/2) - 2, 'text-anchor':'middle', 'font-size':11, 'font-family':'Inter, Arial, sans-serif', fill:'#333', opacity:0.7 });
+            textEl.textContent = lbl;
+            decorG.appendChild(rect);
+            decorG.appendChild(textEl);
+          }catch(e){}
+        }
+      } else {
+        // Single directed flow
+        let srcPort, dstPort, sDir, dDir;
+        if(f.arrow === '->'){
+          if(kindMap[f.left] === 'asset'){
+            ({ srcPort, dstPort, srcDir: sDir, dstDir: dDir } = selectPortsAware(assetId, pa, 'asset', storageId, ps, 'storage', portUsage));
+          } else {
+            ({ srcPort, dstPort, srcDir: sDir, dstDir: dDir } = selectPortsAware(storageId, ps, 'storage', assetId, pa, 'asset', portUsage));
+          }
+        } else if(f.arrow === '<-'){
+          if(kindMap[f.left] === 'asset'){
+            ({ srcPort, dstPort, srcDir: sDir, dstDir: dDir } = selectPortsAware(storageId, ps, 'storage', assetId, pa, 'asset', portUsage));
+          } else {
+            ({ srcPort, dstPort, srcDir: sDir, dstDir: dDir } = selectPortsAware(assetId, pa, 'asset', storageId, ps, 'storage', portUsage));
+          }
+        } else {
+          ({ srcPort, dstPort, srcDir: sDir, dstDir: dDir } = selectPortsAware(assetId, pa, 'asset', storageId, ps, 'storage', portUsage));
+        }
+        const d = orthogonalPath(srcPort.x, srcPort.y, dstPort.x, dstPort.y, sDir, dDir);
+        const path = svgEl('path', { d, stroke:'#333', 'stroke-width':1.5, fill:'none', 'marker-end':'url(#arrow-small)' });
+        edgesG.appendChild(path);
+        // optional label
+        if(f.label){
+          try{
+            const lbl = f.label;
+            const pos = findSafePointOnPath(path, positions, [assetId, storageId]);
+            const m = measureTextSVG(lbl, 11);
+            const padX = 8, padY = 4;
+            const rect = svgEl('rect', { x: pos.x - (m.width/2) - padX, y: pos.y - (m.height/2) - padY, width: m.width + padX*2, height: m.height + padY*2, rx:4, fill:'#fff', stroke:'#e6e6e6', opacity:0.85 });
+            const textEl = svgEl('text', { x: pos.x, y: pos.y + (m.height/2) - 2, 'text-anchor':'middle', 'font-size':11, 'font-family':'Inter, Arial, sans-serif', fill:'#333', opacity:0.7 });
+            textEl.textContent = lbl;
+            decorG.appendChild(rect);
+            decorG.appendChild(textEl);
+          }catch(e){}
+        }
+      }
+    }
+
+    function drawNode(n){
+      const p = positions[n.id];
+      if(!p) return;
+      if(n.kind === 'asset'){
+        const g = svgEl('g', { transform: `translate(${p.x - p.width/2}, ${p.y - p.height/2})` });
+        const fillColor = colorMap.has(n.id) ? (colorMap.get(n.id) || '#fff') : '#fff';
+        if(n.multiple){
+          const shadowRect = svgEl('rect', { x:-6, y:-6, width:p.width, height:p.height, fill: fillColor, stroke:'#333', 'stroke-width':1.5 });
+          g.appendChild(shadowRect);
+        }
+        const rect = svgEl('rect', { x:0, y:0, width:p.width, height:p.height, fill: fillColor, stroke:'#333', 'stroke-width':1.5, filter:'url(#shadow)' });
+        rect.setAttribute('style','cursor:pointer');
+
+        // label placement depends on whether this node is a parent (has children)
+        if(parentSet.has(n.id)){
+          const labelM = measureTextSVG(n.label, 14);
+          const textEl = svgEl('text', { x: labelPadX, y: labelPadY + labelM.height, 'text-anchor':'start', 'font-size':14, 'font-family':'Inter, Arial, sans-serif', fill:'#111' });
+          textEl.textContent = n.label;
+
+          // draw human icon if applicable (keep icon but place label top-left)
+          const isHuman = !!n.human;
+          const iconW = isHuman ? (n.iconWidth || 0) : 0;
+          if(isHuman && iconW > 0){
+            const iconH = Math.min(36, p.height - 12);
+            const iconCx = 8 + Math.round(iconW/2);
+            const iconCy = p.height/2;
+            const iconG = svgEl('g', { transform: `translate(${iconCx}, ${iconCy})` });
+            const headR = Math.max(4, Math.round(iconH * 0.22));
+            const head = svgEl('circle', { cx:0, cy: -Math.round(iconH * 0.18), r: headR, fill:'#fff', stroke:'#333', 'stroke-width':1 });
+            const bodyTop = -Math.round(iconH * 0.18) + headR;
+            const bodyBottom = Math.round(iconH * 0.28);
+            const body = svgEl('line', { x1:0, y1: bodyTop, x2:0, y2: bodyBottom, stroke:'#333', 'stroke-width':1.2, 'stroke-linecap':'round' });
+            const armLeft = svgEl('line', { x1: -Math.round(iconW * 0.45), y1: Math.round(iconH * 0.02), x2: 0, y2: Math.round(iconH * -0.05), stroke:'#333', 'stroke-width':1.2, 'stroke-linecap':'round' });
+            const armRight = svgEl('line', { x1: Math.round(iconW * 0.45), y1: Math.round(iconH * 0.02), x2: 0, y2: Math.round(iconH * -0.05), stroke:'#333', 'stroke-width':1.2, 'stroke-linecap':'round' });
+            const legLeft = svgEl('line', { x1:0, y1: bodyBottom, x2: -Math.round(iconW * 0.28), y2: Math.round(iconH * 0.5), stroke:'#333', 'stroke-width':1.2, 'stroke-linecap':'round' });
+            const legRight = svgEl('line', { x1:0, y1: bodyBottom, x2: Math.round(iconW * 0.28), y2: Math.round(iconH * 0.5), stroke:'#333', 'stroke-width':1.2, 'stroke-linecap':'round' });
+            iconG.appendChild(head);
+            iconG.appendChild(body);
+            iconG.appendChild(armLeft);
+            iconG.appendChild(armRight);
+            iconG.appendChild(legLeft);
+            iconG.appendChild(legRight);
+            g.appendChild(rect);
+            g.appendChild(iconG);
+            g.appendChild(textEl);
+          } else {
+            g.appendChild(rect);
+            g.appendChild(textEl);
+          }
+        } else {
+          // centered label (default)
+          const isHuman = !!n.human;
+          const iconW = isHuman ? (n.iconWidth || 0) : 0;
+          if(isHuman && iconW > 0){
+            const iconH = Math.min(36, p.height - 12);
+            const iconCx = 8 + Math.round(iconW/2);
+            const iconCy = p.height/2;
+            const iconG = svgEl('g', { transform: `translate(${iconCx}, ${iconCy})` });
+            const headR = Math.max(4, Math.round(iconH * 0.22));
+            const head = svgEl('circle', { cx:0, cy: -Math.round(iconH * 0.18), r: headR, fill:'#fff', stroke:'#333', 'stroke-width':1 });
+            const bodyTop = -Math.round(iconH * 0.18) + headR;
+            const bodyBottom = Math.round(iconH * 0.28);
+            const body = svgEl('line', { x1:0, y1: bodyTop, x2:0, y2: bodyBottom, stroke:'#333', 'stroke-width':1.2, 'stroke-linecap':'round' });
+            const armLeft = svgEl('line', { x1: -Math.round(iconW * 0.45), y1: Math.round(iconH * 0.02), x2: 0, y2: Math.round(iconH * -0.05), stroke:'#333', 'stroke-width':1.2, 'stroke-linecap':'round' });
+            const armRight = svgEl('line', { x1: Math.round(iconW * 0.45), y1: Math.round(iconH * 0.02), x2: 0, y2: Math.round(iconH * -0.05), stroke:'#333', 'stroke-width':1.2, 'stroke-linecap':'round' });
+            const legLeft = svgEl('line', { x1:0, y1: bodyBottom, x2: -Math.round(iconW * 0.28), y2: Math.round(iconH * 0.5), stroke:'#333', 'stroke-width':1.2, 'stroke-linecap':'round' });
+            const legRight = svgEl('line', { x1:0, y1: bodyBottom, x2: Math.round(iconW * 0.28), y2: Math.round(iconH * 0.5), stroke:'#333', 'stroke-width':1.2, 'stroke-linecap':'round' });
+            iconG.appendChild(head);
+            iconG.appendChild(body);
+            iconG.appendChild(armLeft);
+            iconG.appendChild(armRight);
+            iconG.appendChild(legLeft);
+            iconG.appendChild(legRight);
+            g.appendChild(rect);
+            g.appendChild(iconG);
+            const textX = Math.round(p.width/2 + iconW/2);
+            const text = svgEl('text', { x: textX, y: p.height/2 + 5, 'text-anchor':'middle', 'font-size':14, 'font-family':'Inter, Arial, sans-serif', fill:'#111' });
+            text.textContent = n.label;
+            g.appendChild(text);
+          } else {
+            const text = svgEl('text', { x: p.width/2, y: p.height/2 + 5, 'text-anchor':'middle', 'font-size':14, 'font-family':'Inter, Arial, sans-serif', fill:'#111' });
+            text.textContent = n.label;
+            g.appendChild(rect);
+            g.appendChild(text);
+          }
+        }
+
+        // attach click / dblclick handlers (with small delay to distinguish)
+        (function(id, grp){
+          function onClick(e){
+            e.stopPropagation();
+            if(clickTimers.has(id)) return;
+            const t = setTimeout(()=> {
+              clickTimers.delete(id);
+              const cur = colorMap.has(id) ? colorMap.get(id) : null;
+              let idx = palette.findIndex(c => c === cur);
+              if(idx === -1) idx = palette.length - 1;
+              const next = (idx + 1) % palette.length;
+              colorMap.set(id, palette[next]);
+              debouncedRender();
+            }, 250);
+            clickTimers.set(id, t);
+          }
+          function onDblClick(e){
+            e.stopPropagation();
+            const t = clickTimers.get(id);
+            if(t){ clearTimeout(t); clickTimers.delete(id); }
+            colorMap.set(id, null);
+            debouncedRender();
+          }
+          grp.addEventListener('click', onClick);
+          grp.addEventListener('dblclick', onDblClick);
+        })(n.id, g);
+        nodesG.appendChild(g);
+      } else if(n.kind === 'storage'){
+        const g = svgEl('g', { transform: `translate(${p.x - p.width/2}, ${p.y - p.height/2})` });
+        const fillColor = colorMap.has(n.id) ? (colorMap.get(n.id) || '#fff') : '#fff';
+        if(n.multiple){
+          const shadowRect = svgEl('rect', { x:-6, y:-6, width:p.width, height:p.height, rx:16, ry:16, fill: fillColor, stroke:'#333', 'stroke-width':1.5 });
+          g.appendChild(shadowRect);
+        }
+        const rect = svgEl('rect', { x:0, y:0, width:p.width, height:p.height, rx:16, ry:16, fill: fillColor, stroke:'#333', 'stroke-width':1.5, filter:'url(#shadow)' });
+        rect.setAttribute('style','cursor:pointer');
+
+        if(parentSet.has(n.id)){
+          // Parent storage: label at top-left so children don't overlap it
+          const labelM = measureTextSVG(n.label, 14);
+          const textEl = svgEl('text', { x: labelPadX, y: labelPadY + labelM.height, 'text-anchor':'start', 'font-size':14, 'font-family':'Inter, Arial, sans-serif', fill:'#111' });
+          textEl.textContent = n.label;
+          g.appendChild(rect);
+          g.appendChild(textEl);
+        } else {
+          // Non-parent storage: centered label
+          const text = svgEl('text', { x: p.width/2, y: p.height/2 + 5, 'text-anchor':'middle', 'font-size':14, 'font-family':'Inter, Arial, sans-serif', fill:'#111' });
+          text.textContent = n.label;
+          g.appendChild(rect);
+          g.appendChild(text);
+        }
+        (function(id, grp){
+          function onClick(e){
+            e.stopPropagation();
+            if(clickTimers.has(id)) return;
+            const t = setTimeout(()=> {
+              clickTimers.delete(id);
+              const cur = colorMap.has(id) ? colorMap.get(id) : null;
+              let idx = palette.findIndex(c => c === cur);
+              if(idx === -1) idx = palette.length - 1;
+              const next = (idx + 1) % palette.length;
+              colorMap.set(id, palette[next]);
+              debouncedRender();
+            }, 250);
+            clickTimers.set(id, t);
+          }
+          function onDblClick(e){
+            e.stopPropagation();
+            const t = clickTimers.get(id);
+            if(t){ clearTimeout(t); clickTimers.delete(id); }
+            colorMap.set(id, null);
+            debouncedRender();
+          }
+          grp.addEventListener('click', onClick);
+          grp.addEventListener('dblclick', onDblClick);
+        })(n.id, g);
+        nodesG.appendChild(g);
+      }
+    }
+
+    // draw parents first then others
+    // Use the deterministic depthMap computed earlier (BFS) to order parents:
+    // - draw outermost parents first (depth asc) so inner parents appended later appear above
+    // order parents outermost -> innermost using depthMap from resize phase
+    const parents = Array.from(parentSet).map(id => nodeById[id]).filter(Boolean).sort((a,b) => (depthMap.get(a.id)||0) - (depthMap.get(b.id)||0));
+    const others = nodes.filter(n => !parentSet.has(n.id));
+    for(const pnode of parents) drawNode(pnode);
+    for(const onode of others) drawNode(onode);
+
+    // Fit-to-view: compute bbox from node positions and apply viewBox with padding
+    let minX=Infinity, minY=Infinity, maxX=-Infinity, maxY=-Infinity;
+    for(const id in positions){
+      const p = positions[id];
+      const left = p.x - p.width/2, top = p.y - p.height/2, right = p.x + p.width/2, bottom = p.y + p.height/2;
+      minX = Math.min(minX, left); minY = Math.min(minY, top);
+      maxX = Math.max(maxX, right); maxY = Math.max(maxY, bottom);
+    }
+    if(minX === Infinity){
+      minX = 0; minY = 0; maxX = 1000; maxY = 600;
+    }
+    const pad = 40;
+    const vbX = minX - pad, vbY = minY - pad, vbW = (maxX - minX) + pad*2, vbH = (maxY - minY) + pad*2;
+    svg.setAttribute('viewBox', `${vbX} ${vbY} ${vbW} ${vbH}`);
+
+    // show errors/summary
+    const errs = Array.from(new Set(errors));
+    ['assets-err','storages-err','connectors-err','inside-err'].forEach(id => { const e = $(id); if(e){ e.style.display='none'; e.textContent=''; }});
+    if (errs.length) {
+      summary.textContent = errs[0];
+      // surface inside-specific errors in the Inside panel error div
+      const insideErrors = errs.filter(s => s.toLowerCase().includes('inside'));
+      if(insideErrors.length){
+        const ie = $('inside-err');
+        if(ie){ ie.style.display = 'block'; ie.textContent = insideErrors.join('; '); }
+      }
+    } else {
+      summary.textContent = `${assets.length} assets • ${storages.length} storages • ${validConnectors.length} connectors • ${validFlows.length} flows`;
+    }
+  }
+
+  const debouncedRender = debounce(render, 180);
+
+  // color palette and state (hex codes; final null means no background)
+  const palette = ['#dff7df', '#d8eaf7', '#f7d8ea', '#ffe8cc', null];
+  const colorMap = new Map(); // id -> hex color string or null
+  const clickTimers = new Map(); // id -> timeout
+
+  // Export / Import helpers
+  function buildExportText(){
+    const parts = [
+      '--- ASSETS ---',
+      assetsTA.value || '',
+      '',
+      '--- STORAGES ---',
+      storagesTA.value || '',
+      '',
+      '--- INSIDE ---',
+      insideTA.value || '',
+      '',
+      '--- CONNECTORS ---',
+      connectorsTA.value || ''
+    ];
+    // append COLORS section if any colors are set
+    if(colorMap && colorMap.size){
+      parts.push('', '--- COLORS ---');
+      for(const [id, color] of colorMap){
+        if(color) parts.push(`${id}: ${color}`);
+      }
+    }
+    return parts.join('\n');
+  }
+
+  function downloadText(filename, text){
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  // Generic blob downloader
+  function downloadBlob(filename, blob){
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  // Export SVG to PNG and download
+  function exportSvgToPng(filename){
+    try{
+      const svgEl = svg;
+      // determine export size from viewBox if available, otherwise use element size
+      let width, height;
+      const vb = svgEl.getAttribute('viewBox');
+      if(vb){
+        const parts = vb.split(/\s+/).map(Number);
+        if(parts.length === 4 && !parts.some(isNaN)){
+          width = parts[2];
+          height = parts[3];
+        }
+      }
+      if(!width || !height){
+        width = svgEl.clientWidth || 1000;
+        height = svgEl.clientHeight || 600;
+      }
+
+      // Clone the SVG node to avoid mutations and serialize
+      const clone = svgEl.cloneNode(true);
+      // Ensure xmlns attribute exists
+      if(!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+
+      const serializer = new XMLSerializer();
+      const svgStr = serializer.serializeToString(clone);
+      const svgBlob = new Blob([svgStr], { type: 'image/svg+xml;charset=utf-8' });
+      const url = URL.createObjectURL(svgBlob);
+
+      const img = new Image();
+      img.onload = () => {
+        try{
+          const canvas = document.createElement('canvas');
+          canvas.width = Math.round(width);
+          canvas.height = Math.round(height);
+          const ctx = canvas.getContext('2d');
+          // white background
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(0,0,canvas.width,canvas.height);
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          canvas.toBlob((pngBlob) => {
+            if(pngBlob) downloadBlob(filename, pngBlob);
+            URL.revokeObjectURL(url);
+          }, 'image/png');
+        }catch(e){
+          URL.revokeObjectURL(url);
+          alert('Failed to render PNG: ' + e.message);
+        }
+      };
+      img.onerror = () => { URL.revokeObjectURL(url); alert('Failed to load SVG data for PNG export'); };
+      // Use a CORS-safe data URL by pointing image at blob URL
+      img.src = url;
+    }catch(e){
+      alert('Export to PNG failed: ' + e.message);
+    }
+  }
+
+  // Export raw SVG content as a .svg file
+  function exportSvg(filename){
+    try{
+      const svgEl = svg;
+      const clone = svgEl.cloneNode(true);
+      if(!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+      const serializer = new XMLSerializer();
+      let svgStr = serializer.serializeToString(clone);
+      // add XML prolog to improve compatibility
+      if(!svgStr.startsWith('<?xml')) svgStr = '<?xml version="1.0" encoding="UTF-8"?>\n' + svgStr;
+      const svgBlob = new Blob([svgStr], { type: 'image/svg+xml;charset=utf-8' });
+      downloadBlob(filename, svgBlob);
+    }catch(e){
+      alert('Export SVG failed: ' + e.message);
+    }
+  }
+
+  function pad2(n){ return n.toString().padStart(2,'0'); }
+  function defaultFilename(){
+    const d = new Date();
+    return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}_${pad2(d.getHours())}-${pad2(d.getMinutes())}-${pad2(d.getSeconds())}-elements.txt`;
+  }
+
+  function defaultPngFilename(){
+    const d = new Date();
+    return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}_${pad2(d.getHours())}-${pad2(d.getMinutes())}-${pad2(d.getSeconds())}-diagram.png`;
+  }
+
+  function defaultSvgFilename(){
+    const d = new Date();
+    return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}_${pad2(d.getHours())}-${pad2(d.getMinutes())}-${pad2(d.getSeconds())}-diagram.svg`;
+  }
+
+  function parseImportText(text){
+    // Robust line-oriented import parser: scan for section markers and collect following lines until next marker.
+    const norm = text.replace(/\r\n/g,'\n');
+    const sections = { assets:'', storages:'', inside:'', connectors:'', flows:'', colors:'' };
+    const markerRe = /^\s*---\s*(ASSETS|STORAGES|INSIDE|CONNECTORS|FLOWS|COLORS)\s*---\s*$/i;
+    const lines = norm.split('\n');
+    // default section if no leading marker
+    let cur = 'assets';
+    let seenAnyMarker = false;
+    for(const rawLine of lines){
+      const line = rawLine.replace(/\r/g,'');
+      const m = line.match(markerRe);
+      if(m){
+        cur = m[1].toLowerCase();
+        seenAnyMarker = true;
+        // reset section content (in case of duplicate markers)
+        sections[cur] = '';
+        continue;
+      }
+      // If we haven't seen any marker yet, we stay in 'assets' (fallback)
+      if(sections[cur].length === 0){
+        sections[cur] = line;
+      } else {
+        sections[cur] += '\n' + line;
+      }
+    }
+    // trim surrounding blank lines from each section
+    for(const k of Object.keys(sections)){
+      sections[k] = sections[k].replace(/^\n+|\n+$/g,'').replace(/\r/g,'');
+    }
+    // If no markers were present, the whole file goes to assets (already handled), but ensure exact trimming
+    return sections;
+  }
+
+  function handleImportFileText(text){
+    try{
+      const secs = parseImportText(text);
+      assetsTA.value = secs.assets;
+      storagesTA.value = secs.storages;
+      insideTA.value = secs.inside || '';
+      // Merge connectors and flows (backward compat: old files have separate FLOWS section)
+      const connParts = [secs.connectors, secs.flows].filter(Boolean);
+      connectorsTA.value = connParts.join('\n');
+      // parse COLORS (if present) and populate colorMap
+      colorMap.clear();
+      if(secs.colors){
+        const lines = secs.colors.split(/\r?\n/);
+        for(const l of lines){
+          const line = l.trim();
+          if(!line) continue;
+          const m = line.match(/^([^:]+):\s*(#?[0-9a-fA-F]{6})\s*$/);
+          if(!m) continue;
+          let id = m[1].trim();
+          let col = m[2].startsWith('#') ? m[2] : ('#' + m[2]);
+          col = col.toLowerCase();
+          colorMap.set(id, col);
+        }
+      }
+      debouncedRender();
+      // small non-blocking notification
+      console.info('Import successful');
+    }catch(e){
+      alert('Import failed: ' + e.message);
+    }
+  }
+
+  // attach UI handlers for export/import
+    document.addEventListener('DOMContentLoaded', () => {
+    const exportBtn = document.getElementById('export-btn');
+    const exportSvgBtn = document.getElementById('export-svg-btn');
+    const exportPngBtn = document.getElementById('export-png-btn');
+    const importBtn = document.getElementById('import-btn');
+    const importFile = document.getElementById('import-file');
+    const clearBtn = document.getElementById('clear-btn');
+    if(exportBtn){
+      exportBtn.addEventListener('click', () => {
+        const txt = buildExportText();
+        downloadText(defaultFilename(), txt);
+      });
+    }
+    if(exportSvgBtn){
+      exportSvgBtn.addEventListener('click', () => {
+        exportSvg(defaultSvgFilename());
+      });
+    }
+    if(exportPngBtn){
+      exportPngBtn.addEventListener('click', () => {
+        exportSvgToPng(defaultPngFilename());
+      });
+    }
+    if(importBtn && importFile){
+      importBtn.addEventListener('click', () => importFile.click());
+      importFile.addEventListener('change', (ev) => {
+        const f = ev.target.files && ev.target.files[0];
+        if(!f) return;
+        const reader = new FileReader();
+        reader.onload = () => { handleImportFileText(String(reader.result)); importFile.value = ''; };
+        reader.onerror = () => { alert('Failed to read file'); importFile.value = ''; };
+        reader.readAsText(f, 'utf-8');
+      });
+ }
+    if(clearBtn){
+      clearBtn.addEventListener('click', () => {
+        if(!window.confirm('Clear all left‑pane content and reset diagram? This cannot be undone.')) return;
+        assetsTA.value = '';
+        storagesTA.value = '';
+        insideTA.value = '';
+        connectorsTA.value = '';
+        ['assets-err','storages-err','connectors-err','inside-err'].forEach(id => {
+          const e = document.getElementById(id);
+          if(e){ e.style.display = 'none'; e.textContent = ''; }
+        });
+        summary.textContent = '';
+        colorMap.clear();
+        debouncedRender();
+      });
+    }
+  });
+
+  // attach events
+  // helper: compute next numeric id for a given prefix from the textarea's existing lines
+  function getNextNumericId(prefix, parsedLines){
+    const used = new Set();
+    for(const line of parsedLines){
+      const p = parseIdLabel(line);
+      if(!p) continue;
+      const m = p.id.match(new RegExp('^' + prefix + '(\\d+)$'));
+      if(m) used.add(Number(m[1]));
+    }
+    let n = 1;
+    while(used.has(n)) n++;
+    return prefix + n;
+  }
+
+  // helper: if the user typed a single ':' at the start of a new line, replace it with next id + ': '
+  function handleAutoIdInsertion(ta, prefix){
+    const selStart = ta.selectionStart;
+    // find start of current line
+    const before = ta.value.slice(0, selStart);
+    const lastNewline = before.lastIndexOf('\n');
+    const lineStart = lastNewline + 1;
+    const lineSoFar = ta.value.slice(lineStart, selStart);
+    // If the user just typed a single ':' at the start of the line (optionally after whitespace)
+    if(lineSoFar.trim() === ':' && lineSoFar.replace(/\s/g,'') === ':'){
+      // compute existing lines for this textarea
+      const rawLines = ta.value.split(/\r?\n/);
+      // find next id (prefix should be 'A' or 'S')
+      const nextId = getNextNumericId(prefix, rawLines);
+      const insert = nextId + ': ';
+      // Replace only the leading ':' (preserve any leading whitespace on the line)
+      const leadingWhitespaceMatch = ta.value.slice(lineStart).match(/^\s*/);
+      const leadingWhitespace = leadingWhitespaceMatch ? leadingWhitespaceMatch[0] : '';
+      const replaceStart = lineStart + leadingWhitespace.length;
+      const newValue = ta.value.slice(0, replaceStart) + insert + ta.value.slice(selStart);
+      const caretPos = replaceStart + insert.length;
+      ta.value = newValue;
+      // set caret after inserted space
+      ta.setSelectionRange(caretPos, caretPos);
+    }
+  }
+
+  // attach input handlers: decorate annotated editors on input, then re-render diagram
+  [connectorsTA, insideTA].forEach(el => el.addEventListener('input', () => {
+    decorateEditor(el);
+    debouncedRender();
+  }));
+  // ensure auto-id insertion still runs for assets/storages; also re-decorate annotated editors
+  assetsTA.addEventListener('input', (e) => { handleAutoIdInsertion(assetsTA, 'A'); decorateEditor(insideTA); decorateEditor(connectorsTA); debouncedRender(); });
+  storagesTA.addEventListener('input', (e) => { handleAutoIdInsertion(storagesTA, 'S'); decorateEditor(insideTA); decorateEditor(connectorsTA); debouncedRender(); });
+
+  // initial render (seed default colors then render)
+  colorMap.set('A3M', '#dff7df');
+  colorMap.set('H1', '#f7d8ea');
+  colorMap.set('H2', '#d8eaf7');
+  window.addEventListener('load', () => { debouncedRender(); });
+  window.__diagramRender = render;
+})();
+</script>
+</body>
+</html>
