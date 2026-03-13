@@ -2019,7 +2019,7 @@ S2: cache</textarea>
     for(const line of parsedLines){
       const p = parseIdLabel(line);
       if(!p) continue;
-      const m = p.id.match(new RegExp('^' + prefix + '(\\d+)$'));
+      const m = p.id.match(new RegExp('^' + prefix + '(\\d+)M?$', 'i'));
       if(m) used.add(Number(m[1]));
     }
     let n = 1;
