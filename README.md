@@ -4,6 +4,8 @@ A single-file, client-side diagram editor for creating architecture and system d
 
 No build step, no server — just open `index.html` in a modern browser.
 
+![screenshot](diagr.png)
+
 ## Usage
 
 Open `index.html` in your browser. The left column has four text panes; the right column shows the live SVG diagram.
