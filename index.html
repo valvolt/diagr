@@ -1746,11 +1746,11 @@ S2: cache</textarea>
         });
         const childNodes = sortedChildren.map(cid => nodeById[cid]).filter(Boolean);
         const childLayoutH = computeLayout(childNodes, childEdges, {
-          colSpacing: 30, rowSpacing: 30, marginX: 0, marginY: 0,
+          colSpacing: 40, rowSpacing: 30, marginX: 0, marginY: 0,
           maxPasses: 15, center: true, returnBounds: true
         });
         const childLayoutV = computeLayout(childNodes, childEdges, {
-          colSpacing: 30, rowSpacing: 30, marginX: 0, marginY: 0,
+          colSpacing: 40, rowSpacing: 30, marginX: 0, marginY: 0,
           maxPasses: 15, center: true, returnBounds: true, vertical: true
         });
 
@@ -1901,6 +1901,59 @@ S2: cache</textarea>
                 // Restore all positions
                 for(const id in saved) positions[id] = saved[id];
               }
+            }
+          }
+        }
+      }
+    })();
+
+    // Post-layout: resolve overlaps between any positioned nodes
+    (function resolveOverlaps(){
+      const ids = Object.keys(positions);
+      let changed = true, passes = 0;
+      function moveDescendants(id, dx, dy){
+        const ch = insideMap.get(id);
+        if(!ch) return;
+        for(const c of ch){
+          if(positions[c]){
+            positions[c].x += dx;
+            positions[c].y += dy;
+          }
+          moveDescendants(c, dx, dy);
+        }
+      }
+      while(changed && passes < 20){
+        changed = false;
+        passes++;
+        for(let i = 0; i < ids.length; i++){
+          for(let j = i + 1; j < ids.length; j++){
+            const a = ids[i], b = ids[j];
+            const pa = positions[a], pb = positions[b];
+            if(!pa || !pb) continue;
+            // Skip if one is inside the other (parent-child)
+            if(childParent.get(a) === b || childParent.get(b) === a) continue;
+
+            const gap = 20; // minimum edge-to-edge gap
+            const overlapX = Math.min(pa.x + pa.width/2, pb.x + pb.width/2)
+                           - Math.max(pa.x - pa.width/2, pb.x - pb.width/2) + gap;
+            const overlapY = Math.min(pa.y + pa.height/2, pb.y + pb.height/2)
+                           - Math.max(pa.y - pa.height/2, pb.y - pb.height/2) + gap;
+            if(overlapX <= 0 || overlapY <= 0) continue;
+
+            // Push apart along the axis with less overlap
+            changed = true;
+            if(overlapX < overlapY){
+              const shift = overlapX / 2;
+              const dxA = pa.x <= pb.x ? -shift : shift;
+              pa.x += dxA; pb.x -= dxA;
+              moveDescendants(a, dxA, 0);
+              moveDescendants(b, -dxA, 0);
+            } else {
+              const shift = overlapY / 2;
+              const dyA = pa.y <= pb.y ? -shift : shift;
+              pa.y += dyA; pb.y -= dyA;
+              moveDescendants(a, 0, dyA);
+              moveDescendants(b, 0, -dyA);
             }
           }
         }
