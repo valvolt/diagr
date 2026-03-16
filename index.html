@@ -209,6 +209,41 @@ S2: cache</textarea>
     return map;
   }
 
+  // Extract IDs per line from an assets/storages textarea
+  function getIdsByLine(text){
+    return parseLines(text).map(l => {
+      const p = parseIdLabel(l);
+      return p ? p.id : null;
+    });
+  }
+
+  // Detect renames by comparing old vs new IDs at each line position
+  function detectRenames(oldIds, newIds){
+    const renames = [];
+    const newSet = new Set(newIds.filter(Boolean));
+    const oldSet = new Set(oldIds.filter(Boolean));
+    for(let i = 0; i < Math.max(oldIds.length, newIds.length); i++){
+      const oldId = oldIds[i] || null;
+      const newId = newIds[i] || null;
+      if(oldId && newId && oldId !== newId && !newSet.has(oldId) && !oldSet.has(newId)){
+        renames.push({ from: oldId, to: newId });
+      }
+    }
+    return renames;
+  }
+
+  // Apply renames to an annotated editor (replace old IDs with new ones)
+  function applyRenames(editor, renames){
+    if(!renames.length) return;
+    let text = editor.value;
+    for(const r of renames){
+      const re = new RegExp('\\b' + r.from.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'g');
+      text = text.replace(re, r.to);
+    }
+    editor.value = text;
+    decorateEditor(editor);
+  }
+
   // Get raw text from an annotated editor (strip ghost labels)
   function getEditorRawText(el){
     const clone = el.cloneNode(true);
@@ -377,21 +412,185 @@ S2: cache</textarea>
   }
 
   // Grid layout constants
-  const GRID_COL_SPACING = 200;
-  const GRID_ROW_SPACING = 120;
+  // The grid uses a sub-cell system: each asset/storage ("bold cell") = 2×2 sub-cells.
+  // Bold gridlines (asset borders) are at the outer edges of 2×2 blocks.
+  // Thin gridlines (arrow corridors) are at the internal boundaries between sub-cells.
+  // Arrows route along thin gridlines, never along bold borders.
+  const GRID_COL_SPACING = 60;  // gap between adjacent bold cells horizontally
+  const GRID_ROW_SPACING = 40;  // gap between adjacent bold cells vertically
   const GRID_MARGIN_X = 100;
   const GRID_MARGIN_Y = 60;
   const BIDI_OFFSET = 7;
 
-  // Port-based system: get the midpoint of a specific side of a node
+  // Port-based system: get the CENTER of a node (thin gridline intersection)
+  // All ports are at the cell center; direction controls which way the arrow exits
   function nodePort(pos, kind, direction){
-    const cx = pos.x, cy = pos.y, w = pos.width, h = pos.height;
-    switch(direction){
-      case 'right':  return { x: cx + w/2, y: cy };
-      case 'left':   return { x: cx - w/2, y: cy };
-      case 'top':    return { x: cx, y: cy - h/2 };
-      case 'bottom': return { x: cx, y: cy + h/2 };
+    // Return cell center — arrows start/end at the thin gridline cross
+    return { x: pos.x, y: pos.y };
+  }
+
+  // Trim an orthogonal SVG path so it starts at the source node's edge and ends at the
+  // destination node's edge. Paths are computed center-to-center for routing, but only
+  // the portion outside the nodes should be visible.
+  // Returns { d: trimmedPathString, startPt: {x,y}, endPt: {x,y} }
+  function trimPathAtNodeEdges(d, srcPos, dstPos){
+    // Parse waypoints
+    const pts = [];
+    const parts = d.trim().split(/\s+/);
+    for(let i = 0; i < parts.length; i++){
+      if(parts[i] === 'M' || parts[i] === 'L'){
+        pts.push([parseFloat(parts[i+1]), parseFloat(parts[i+2])]);
+        i += 2;
+      }
     }
+    if(pts.length < 2) return { d, startPt: { x: pts[0]?.[0]||0, y: pts[0]?.[1]||0 }, endPt: { x: pts[0]?.[0]||0, y: pts[0]?.[1]||0 } };
+
+    // Find where a segment (ax,ay)→(bx,by) exits a rectangle (center-based pos)
+    function segRectIntersect(ax, ay, bx, by, pos){
+      const left = pos.x - pos.width/2, right = pos.x + pos.width/2;
+      const top = pos.y - pos.height/2, bottom = pos.y + pos.height/2;
+      const dx = bx - ax, dy = by - ay;
+      let tMin = 0, tMax = 1;
+      const hits = [];
+      // Check all 4 sides
+      if(Math.abs(dx) > 0.001){
+        const tL = (left - ax) / dx;
+        const yL = ay + tL * dy;
+        if(tL >= -0.001 && tL <= 1.001 && yL >= top - 0.5 && yL <= bottom + 0.5) hits.push({ t: tL, x: left, y: yL });
+        const tR = (right - ax) / dx;
+        const yR = ay + tR * dy;
+        if(tR >= -0.001 && tR <= 1.001 && yR >= top - 0.5 && yR <= bottom + 0.5) hits.push({ t: tR, x: right, y: yR });
+      }
+      if(Math.abs(dy) > 0.001){
+        const tT = (top - ay) / dy;
+        const xT = ax + tT * dx;
+        if(tT >= -0.001 && tT <= 1.001 && xT >= left - 0.5 && xT <= right + 0.5) hits.push({ t: tT, x: xT, y: top });
+        const tB = (bottom - ay) / dy;
+        const xB = ax + tB * dx;
+        if(tB >= -0.001 && tB <= 1.001 && xB >= left - 0.5 && xB <= right + 0.5) hits.push({ t: tB, x: xB, y: bottom });
+      }
+      return hits;
+    }
+
+    function isInsideRect(x, y, pos){
+      return x >= pos.x - pos.width/2 - 0.5 && x <= pos.x + pos.width/2 + 0.5 &&
+             y >= pos.y - pos.height/2 - 0.5 && y <= pos.y + pos.height/2 + 0.5;
+    }
+
+    // Trim from start: find the last point still inside srcPos, replace with edge crossing
+    let startIdx = 0;
+    let startPt = [pts[0][0], pts[0][1]];
+    for(let i = 0; i < pts.length - 1; i++){
+      const ax = pts[i][0], ay = pts[i][1];
+      const bx = pts[i+1][0], by = pts[i+1][1];
+      if(isInsideRect(ax, ay, srcPos) && !isInsideRect(bx, by, srcPos)){
+        // This segment exits the source node
+        const hits = segRectIntersect(ax, ay, bx, by, srcPos);
+        if(hits.length > 0){
+          // Pick the hit closest to the exit end (largest t)
+          hits.sort((a, b) => b.t - a.t);
+          startPt = [hits[0].x, hits[0].y];
+          startIdx = i + 1;
+        }
+        break;
+      } else if(isInsideRect(ax, ay, srcPos) && isInsideRect(bx, by, srcPos)){
+        startIdx = i + 1;
+        startPt = [bx, by];
+      }
+    }
+
+    // Trim from end: find the last point still inside dstPos, replace with edge crossing
+    let endIdx = pts.length - 1;
+    let endPt = [pts[pts.length - 1][0], pts[pts.length - 1][1]];
+    for(let i = pts.length - 1; i > 0; i--){
+      const ax = pts[i][0], ay = pts[i][1];
+      const bx = pts[i-1][0], by = pts[i-1][1];
+      if(isInsideRect(ax, ay, dstPos) && !isInsideRect(bx, by, dstPos)){
+        // This segment (going backwards) exits the destination node
+        const hits = segRectIntersect(ax, ay, bx, by, dstPos);
+        if(hits.length > 0){
+          hits.sort((a, b) => b.t - a.t);
+          endPt = [hits[0].x, hits[0].y];
+          endIdx = i - 1;
+        }
+        break;
+      } else if(isInsideRect(ax, ay, dstPos) && isInsideRect(bx, by, dstPos)){
+        endIdx = i - 1;
+        endPt = [bx, by];
+      }
+    }
+
+    // Build trimmed path
+    const trimmed = [startPt];
+    for(let i = startIdx; i <= endIdx; i++){
+      trimmed.push([pts[i][0], pts[i][1]]);
+    }
+    trimmed.push(endPt);
+
+    // Remove duplicate/collinear points
+    const clean = [trimmed[0]];
+    for(let i = 1; i < trimmed.length - 1; i++){
+      const prev = clean[clean.length - 1], curr = trimmed[i], next = trimmed[i + 1];
+      const sameX = Math.abs(prev[0] - curr[0]) < 1 && Math.abs(curr[0] - next[0]) < 1;
+      const sameY = Math.abs(prev[1] - curr[1]) < 1 && Math.abs(curr[1] - next[1]) < 1;
+      if(!sameX && !sameY) clean.push(curr);
+    }
+    clean.push(trimmed[trimmed.length - 1]);
+
+    // Remove segments where start ≈ end (zero-length)
+    if(clean.length >= 2){
+      const dStr = 'M ' + clean.map(p => `${p[0]} ${p[1]}`).join(' L ');
+      return { d: dStr, startPt: { x: clean[0][0], y: clean[0][1] }, endPt: { x: clean[clean.length-1][0], y: clean[clean.length-1][1] } };
+    }
+    return { d, startPt: { x: pts[0][0], y: pts[0][1] }, endPt: { x: pts[pts.length-1][0], y: pts[pts.length-1][1] } };
+  }
+
+  // Trim a Bézier SVG path element at node boundaries. Must be in DOM for getTotalLength.
+  // Returns { d: trimmedPathString, startPt, endPt } or null if no trimming needed.
+  function trimBezierAtNodeEdges(pathElem, srcPos, dstPos){
+    const totalLen = pathElem.getTotalLength();
+    if(totalLen < 1) return null;
+    const STEP = 1;
+
+    function isInsideRect(x, y, pos){
+      return x >= pos.x - pos.width/2 - 0.5 && x <= pos.x + pos.width/2 + 0.5 &&
+             y >= pos.y - pos.height/2 - 0.5 && y <= pos.y + pos.height/2 + 0.5;
+    }
+
+    // Find distance where path exits srcPos
+    let startDist = 0;
+    for(let d = 0; d <= totalLen; d += STEP){
+      const pt = pathElem.getPointAtLength(d);
+      if(!isInsideRect(pt.x, pt.y, srcPos)){ startDist = d; break; }
+    }
+    // Find distance where path enters dstPos (from end)
+    let endDist = totalLen;
+    for(let d = totalLen; d >= 0; d -= STEP){
+      const pt = pathElem.getPointAtLength(d);
+      if(!isInsideRect(pt.x, pt.y, dstPos)){ endDist = d; break; }
+    }
+
+    if(startDist >= endDist) return null;
+
+    // Sample the trimmed portion and build a polyline path
+    const samplePts = [];
+    for(let d = startDist; d <= endDist; d += 2){
+      const pt = pathElem.getPointAtLength(d);
+      samplePts.push([pt.x, pt.y]);
+    }
+    // Ensure we include the exact end point
+    const endPt = pathElem.getPointAtLength(endDist);
+    if(samplePts.length === 0 || Math.abs(samplePts[samplePts.length-1][0] - endPt.x) > 0.5 || Math.abs(samplePts[samplePts.length-1][1] - endPt.y) > 0.5){
+      samplePts.push([endPt.x, endPt.y]);
+    }
+    if(samplePts.length < 2) return null;
+
+    const dStr = 'M ' + samplePts.map(p => `${p[0].toFixed(1)} ${p[1].toFixed(1)}`).join(' L ');
+    return {
+      d: dStr,
+      startPt: { x: samplePts[0][0], y: samplePts[0][1] },
+      endPt: { x: samplePts[samplePts.length-1][0], y: samplePts[samplePts.length-1][1] }
+    };
   }
 
   // Choose exit/entry ports based on relative position of two nodes
@@ -502,15 +701,12 @@ S2: cache</textarea>
 
   // Orthogonal path helpers — direction-aware routing
   // Constraint: first segment must move in srcDir, last segment must approach from dstDir
-  function orthogonalPath(x1, y1, x2, y2, srcDir, dstDir){
+  function orthogonalPath(x1, y1, x2, y2, srcDir, dstDir, obstacles, excludeIds){
     const ALIGN_TOL = 5;
     const CL = 30; // clearance distance for fallback routing
     const isH = d => d === 'left' || d === 'right';
     const dirVec = { right:[1,0], left:[-1,0], top:[0,-1], bottom:[0,1] };
 
-    // Check if first segment from (x1,y1) toward (nx,ny) respects srcDir
-    // Left/right ports require a horizontal first segment (same y, meaningful x movement)
-    // Top/bottom ports require a vertical first segment (same x, meaningful y movement)
     function validFirst(nx, ny){
       if(srcDir === 'right')  return Math.abs(ny - y1) < ALIGN_TOL && nx > x1 + ALIGN_TOL;
       if(srcDir === 'left')   return Math.abs(ny - y1) < ALIGN_TOL && nx < x1 - ALIGN_TOL;
@@ -518,13 +714,44 @@ S2: cache</textarea>
       if(srcDir === 'top')    return Math.abs(nx - x1) < ALIGN_TOL && ny < y1 - ALIGN_TOL;
       return true;
     }
-    // Check if last segment into (x2,y2) from (px,py) respects dstDir
     function validLast(px, py){
       if(dstDir === 'left')   return Math.abs(py - y2) < ALIGN_TOL && px < x2 - ALIGN_TOL;
       if(dstDir === 'right')  return Math.abs(py - y2) < ALIGN_TOL && px > x2 + ALIGN_TOL;
       if(dstDir === 'top')    return Math.abs(px - x2) < ALIGN_TOL && py < y2 - ALIGN_TOL;
       if(dstDir === 'bottom') return Math.abs(px - x2) < ALIGN_TOL && py > y2 + ALIGN_TOL;
       return true;
+    }
+
+    // Check if an orthogonal segment intersects any obstacle rectangle
+    function segmentHitsObstacle(pts){
+      if(!obstacles) return false;
+      for(const id in obstacles){
+        if(excludeIds && excludeIds.includes(id)) continue;
+        const o = obstacles[id];
+        const left = o.x - o.width/2 + 2, right = o.x + o.width/2 - 2;
+        const top = o.y - o.height/2 + 2, bottom = o.y + o.height/2 - 2;
+        for(let i = 0; i < pts.length - 1; i++){
+          const ax = pts[i][0], ay = pts[i][1];
+          const bx = pts[i+1][0], by = pts[i+1][1];
+          // Horizontal segment
+          if(Math.abs(ay - by) < 1){
+            const segY = ay;
+            if(segY > top && segY < bottom){
+              const segL = Math.min(ax, bx), segR = Math.max(ax, bx);
+              if(segR > left && segL < right) return true;
+            }
+          }
+          // Vertical segment
+          if(Math.abs(ax - bx) < 1){
+            const segX = ax;
+            if(segX > left && segX < right){
+              const segT = Math.min(ay, by), segB = Math.max(ay, by);
+              if(segB > top && segT < bottom) return true;
+            }
+          }
+        }
+      }
+      return false;
     }
 
     // Build path string from waypoints, removing collinear intermediates
@@ -544,7 +771,8 @@ S2: cache</textarea>
     // 1. Try straight line
     if(Math.abs(y1 - y2) < ALIGN_TOL || Math.abs(x1 - x2) < ALIGN_TOL){
       if(validFirst(x2, y2) && validLast(x1, y1)){
-        return `M ${x1} ${y1} L ${x2} ${y2}`;
+        const pts = [[x1,y1],[x2,y2]];
+        if(!segmentHitsObstacle(pts)) return buildPath(pts);
       }
     }
 
@@ -552,27 +780,29 @@ S2: cache</textarea>
 
     // 2. Try L-shape (two options)
     if(srcH !== dstH){
-      // Option A: horizontal first, then vertical
-      if(validFirst(x2, y1) && validLast(x2, y1)){
-        return buildPath([[x1,y1],[x2,y1],[x2,y2]]);
+      const ptsA = [[x1,y1],[x2,y1],[x2,y2]];
+      if(validFirst(x2, y1) && validLast(x2, y1) && !segmentHitsObstacle(ptsA)){
+        return buildPath(ptsA);
       }
-      // Option B: vertical first, then horizontal
-      if(validFirst(x1, y2) && validLast(x1, y2)){
-        return buildPath([[x1,y1],[x1,y2],[x2,y2]]);
+      const ptsB = [[x1,y1],[x1,y2],[x2,y2]];
+      if(validFirst(x1, y2) && validLast(x1, y2) && !segmentHitsObstacle(ptsB)){
+        return buildPath(ptsB);
       }
     }
 
     // 3. Try S-shape
     if(srcH && dstH){
       const midX = (x1 + x2) / 2;
-      if(validFirst(midX, y1) && validLast(midX, y2)){
-        return buildPath([[x1,y1],[midX,y1],[midX,y2],[x2,y2]]);
+      const ptsS = [[x1,y1],[midX,y1],[midX,y2],[x2,y2]];
+      if(validFirst(midX, y1) && validLast(midX, y2) && !segmentHitsObstacle(ptsS)){
+        return buildPath(ptsS);
       }
     }
     if(!srcH && !dstH){
       const midY = (y1 + y2) / 2;
-      if(validFirst(x1, midY) && validLast(x2, midY)){
-        return buildPath([[x1,y1],[x1,midY],[x2,midY],[x2,y2]]);
+      const ptsS = [[x1,y1],[x1,midY],[x2,midY],[x2,y2]];
+      if(validFirst(x1, midY) && validLast(x2, midY) && !segmentHitsObstacle(ptsS)){
+        return buildPath(ptsS);
       }
     }
 
@@ -581,17 +811,15 @@ S2: cache</textarea>
     const sx = x1 + sv[0] * CL, sy = y1 + sv[1] * CL;
     const ex = x2 + ev[0] * CL, ey = y2 + ev[1] * CL;
 
-    // If extension points share an axis, connect directly
     if(Math.abs(sx - ex) < ALIGN_TOL || Math.abs(sy - ey) < ALIGN_TOL){
       return buildPath([[x1,y1],[sx,sy],[ex,ey],[x2,y2]]);
     }
 
-    // Need one bend between extensions — turn perpendicular after src clearance
     let bx, by;
     if(isH(srcDir)){
-      bx = sx; by = ey; // go vertical after horizontal clearance
+      bx = sx; by = ey;
     } else {
-      bx = ex; by = sy; // go horizontal after vertical clearance
+      bx = ex; by = sy;
     }
     return buildPath([[x1,y1],[sx,sy],[bx,by],[ex,ey],[x2,y2]]);
   }
@@ -702,9 +930,15 @@ S2: cache</textarea>
   }
 
   // Layout: input-order grid with connector-driven swap optimization
-  function computeLayout(nodes, edges){
+  function computeLayout(nodes, edges, opts){
+    opts = opts || {};
+    const colSpacing = opts.colSpacing || GRID_COL_SPACING;
+    const rowSpacing = opts.rowSpacing || GRID_ROW_SPACING;
+    const marginX = opts.marginX ?? GRID_MARGIN_X;
+    const marginY = opts.marginY ?? GRID_MARGIN_Y;
+    const maxPasses = opts.maxPasses || 30;
     const n = nodes.length;
-    if(n === 0) return {};
+    if(n === 0) return opts.returnBounds ? { positions: {}, gridW: 0, gridH: 0 } : {};
 
     const nodeMap = {};
     for(const nd of nodes) nodeMap[nd.id] = nd;
@@ -916,7 +1150,7 @@ S2: cache</textarea>
     function swapOptimize(){
       let improved = true;
       let passes = 0;
-      while(improved && passes < 30){
+      while(improved && passes < maxPasses){
         improved = false;
         passes++;
         const scoreBefore = totalArrowSteps();
@@ -1024,15 +1258,33 @@ S2: cache</textarea>
       const p = pos[nd.id];
       if(!p) continue;
       // Cumulative x: sum of previous column widths + spacing
-      let px = GRID_MARGIN_X;
-      for(let c = 0; c < p.col; c++) px += colWidths[c] + GRID_COL_SPACING;
+      let px = marginX;
+      for(let c = 0; c < p.col; c++) px += colWidths[c] + colSpacing;
       px += colWidths[p.col] / 2;
 
-      let py = GRID_MARGIN_Y;
-      for(let r = 0; r < p.row; r++) py += rowHeights[r] + GRID_ROW_SPACING;
+      let py = marginY;
+      for(let r = 0; r < p.row; r++) py += rowHeights[r] + rowSpacing;
       py += rowHeights[p.row] / 2;
 
       res[nd.id] = { x: px, y: py, width: nd.width, height: nd.height };
+    }
+
+    if(opts.returnBounds){
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for(const id in res){
+        const p = res[id];
+        minX = Math.min(minX, p.x - p.width/2);
+        minY = Math.min(minY, p.y - p.height/2);
+        maxX = Math.max(maxX, p.x + p.width/2);
+        maxY = Math.max(maxY, p.y + p.height/2);
+      }
+      const gridW = n > 0 ? maxX - minX : 0;
+      const gridH = n > 0 ? maxY - minY : 0;
+      if(opts.center){
+        const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+        for(const id in res){ res[id].x -= cx; res[id].y -= cy; }
+      }
+      return { positions: res, gridW, gridH };
     }
     return res;
   }
@@ -1168,7 +1420,7 @@ S2: cache</textarea>
     }
 
     // auto-resize parents to fit children (deterministic, bottom-up)
-    const padLeft = 12, padRight = 12, padTop = 12, padBottom = 12, labelPadX = 8, labelPadY = 6, spacingY = 30;
+    const padLeft = 20, padRight = 20, padTop = 20, padBottom = 16, labelPadX = 8, labelPadY = 6;
 
     // Build a deterministic childrenMap from insideMap
     const childrenMap = new Map();
@@ -1203,30 +1455,7 @@ S2: cache</textarea>
       for(const p of childrenMap.keys()) if(!depthMap.has(p)) depthMap.set(p, 0);
     }
 
-    // Auto-resize parents bottom-up (innermost first) so outer parents account for inner sizes
-    if(childrenMap.size){
-      const parentsByDepthDesc = Array.from(childrenMap.keys()).sort((a,b) => (depthMap.get(b) || 0) - (depthMap.get(a) || 0));
-      for(const parent of parentsByDepthDesc){
-        const parentNode = nodeById[parent];
-        if(!parentNode) continue;
-        const children = childrenMap.get(parent) || [];
-        let maxChildW = 0, totalChildH = 0;
-        for(const cid of children){
-          const cn = nodeById[cid];
-          if(!cn) continue;
-          maxChildW = Math.max(maxChildW, cn.width);
-          totalChildH += cn.height + spacingY;
-        }
-        if(totalChildH > 0) totalChildH -= spacingY;
-        const labelM = measureTextSVG(parentNode.label, 14);
-        const neededW = Math.max(parentNode.width, maxChildW + padLeft + padRight);
-        const neededH = Math.max(parentNode.height, labelM.height + labelPadY + padTop + padBottom + totalChildH);
-        if(neededW > parentNode.width) parentNode.width = neededW;
-        if(neededH > parentNode.height) parentNode.height = neededH;
-      }
-    }
-
-    // Edges for layout
+    // Edges for layout (built early so child layout can use them)
     const edgesForLayout = [];
     let ec = 0;
     for(const c of validConnectors){
@@ -1239,6 +1468,50 @@ S2: cache</textarea>
       else { assetId = f.right; storageId = f.left; }
       edgesForLayout.push({ id: 'e'+(ec++), source: assetId, target: storageId });
       if(f.arrow === '<->' || f.type === 'read-write') edgesForLayout.push({ id: 'e'+(ec++), source: storageId, target: assetId });
+    }
+
+    // Auto-resize parents bottom-up (innermost first) using 2D grid child layout
+    if(childrenMap.size){
+      const parentsByDepthDesc = Array.from(childrenMap.keys()).sort((a,b) => (depthMap.get(b) || 0) - (depthMap.get(a) || 0));
+      for(const parent of parentsByDepthDesc){
+        const parentNode = nodeById[parent];
+        if(!parentNode) continue;
+        const children = childrenMap.get(parent) || [];
+
+        // Collect edges among children of this parent
+        const childSet = new Set(children);
+        const childEdges = [];
+        for(const e of edgesForLayout){
+          if(childSet.has(e.source) && childSet.has(e.target)){
+            childEdges.push(e);
+          }
+        }
+
+        // Build child node array — sort so externally-connected children are last (placed at grid edges)
+        const sortedChildren = children.slice().sort((a, b) => {
+          const aExt = edgesForLayout.some(e =>
+            (e.source === a && !childSet.has(e.target) && e.target !== parent) ||
+            (e.target === a && !childSet.has(e.source) && e.source !== parent));
+          const bExt = edgesForLayout.some(e =>
+            (e.source === b && !childSet.has(e.target) && e.target !== parent) ||
+            (e.target === b && !childSet.has(e.source) && e.source !== parent));
+          return (aExt ? 1 : 0) - (bExt ? 1 : 0);
+        });
+        const childNodes = sortedChildren.map(cid => nodeById[cid]).filter(Boolean);
+        const childLayout = computeLayout(childNodes, childEdges, {
+          colSpacing: 30, rowSpacing: 30, marginX: 0, marginY: 0,
+          maxPasses: 15, center: true, returnBounds: true
+        });
+
+        const labelM = measureTextSVG(parentNode.label, 14);
+        const neededW = Math.max(parentNode.width, childLayout.gridW + padLeft + padRight);
+        const neededH = Math.max(parentNode.height, labelM.height + labelPadY + padTop + padBottom + childLayout.gridH);
+        if(neededW > parentNode.width) parentNode.width = neededW;
+        if(neededH > parentNode.height) parentNode.height = neededH;
+
+        // Store child layout for later positioning
+        parentNode._childLayout = childLayout;
+      }
     }
 
     // compute layout positions — exclude child nodes (they're positioned inside parents later)
@@ -1264,35 +1537,33 @@ S2: cache</textarea>
     }
     const positions = computeLayout(gridNodes, gridEdges);
 
-    // after layout, position children inside parents (override layout positions)
+    // after layout, position children inside parents using pre-computed grid layout
     if(typeof insideMap !== 'undefined' && insideMap && insideMap.size){
       for(const [parent, children] of insideMap.entries()){
         const p = positions[parent];
         if(!p) continue;
         const parentNode = nodeById[parent];
-        const left = p.x - p.width/2;
-        const top = p.y - p.height/2;
+        const childLayout = parentNode._childLayout;
+        if(!childLayout) continue;
+
         const labelM = measureTextSVG(parentNode.label, 14);
-        let curY = top + labelM.height + labelPadY + padTop;
-          // Sort: children without external connections first (top), externally-connected last (bottom)
-          const childSet = new Set(children);
-          const sorted = children.slice().sort((a, b) => {
-            const aExt = edgesForLayout.some(e =>
-              (e.source === a && !childSet.has(e.target) && e.target !== parent) ||
-              (e.target === a && !childSet.has(e.source) && e.source !== parent));
-            const bExt = edgesForLayout.some(e =>
-              (e.source === b && !childSet.has(e.target) && e.target !== parent) ||
-              (e.target === b && !childSet.has(e.source) && e.source !== parent));
-            return (aExt ? 1 : 0) - (bExt ? 1 : 0);
-          });
-          for(const cid of sorted){
-            const cn = nodeById[cid];
-            if(!cn) continue;
-            const childX = p.x;
-            const childY = curY + cn.height/2;
-            positions[cid] = { x: childX, y: childY, width: cn.width, height: cn.height };
-            curY += cn.height + spacingY;
-          }
+        // Anchor: center of available content area inside parent
+        const contentTop = (p.y - p.height/2) + labelM.height + labelPadY + padTop;
+        const contentCenterX = p.x;
+        const contentCenterY = contentTop + childLayout.gridH / 2;
+
+        for(const cid of children){
+          const cp = childLayout.positions[cid];
+          if(!cp) continue;
+          const cn = nodeById[cid];
+          if(!cn) continue;
+          positions[cid] = {
+            x: contentCenterX + cp.x,
+            y: contentCenterY + cp.y,
+            width: cn.width,
+            height: cn.height
+          };
+        }
       }
     }
 
@@ -1425,24 +1696,50 @@ S2: cache</textarea>
     const portUsage = {};
     for(const n of nodes) portUsage[n.id] = { top: 0, bottom: 0, left: 0, right: 0 };
 
+    // Helper: collect node + all its ancestors (for obstacle exclusion)
+    function nodeAndAncestors(id){
+      const result = [id];
+      let cur = id;
+      while(childParent.has(cur)){ cur = childParent.get(cur); result.push(cur); }
+      return result;
+    }
+
+    // Edge click: toggle red highlight and bring to foreground
+    function addEdgeClickHandler(g){
+      g.setAttribute('style', 'cursor:pointer');
+      g.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const isRed = g.dataset.red === '1';
+        const color = isRed ? '#333' : 'red';
+        g.querySelectorAll('path:not([stroke="transparent"])').forEach(p => p.setAttribute('stroke', color));
+        g.querySelectorAll('polygon').forEach(p => p.setAttribute('fill', color));
+        g.querySelectorAll('circle').forEach(c => c.setAttribute('stroke', color));
+        g.querySelectorAll('text').forEach(t => t.setAttribute('fill', color));
+        g.dataset.red = isRed ? '0' : '1';
+        if(!isRed) g.parentNode.appendChild(g);
+      });
+    }
+
     // Draw connectors (asset-asset) using orthogonal routing with TAM-style decorations
     for(const c of validConnectors){
       const pa = positions[c.a], pb = positions[c.b];
       if(!pa || !pb) continue;
       const { srcPort: p1, dstPort: p2, srcDir, dstDir } = selectPortsAware(c.a, pa, 'asset', c.b, pb, 'asset', portUsage);
+      const excl = [...nodeAndAncestors(c.a), ...nodeAndAncestors(c.b)];
+      const dFull = orthogonalPath(p1.x, p1.y, p2.x, p2.y, srcDir, dstDir, positions, excl);
 
-      if(c.bidi){
-        // single path with decoration showing arrowheads in both directions
-        const d = orthogonalPath(p1.x, p1.y, p2.x, p2.y, srcDir, dstDir);
-        const path = svgEl('path', { d, stroke:'#333', 'stroke-width':1.5, fill:'none' });
-        edgesG.appendChild(path);
-        try{ drawConnectorDecor(path, c.label || null, decorG, positions, [c.a, c.b], true); }catch(e){}
-      } else {
-        const d = orthogonalPath(p1.x, p1.y, p2.x, p2.y, srcDir, dstDir);
-        const path = svgEl('path', { d, stroke:'#333', 'stroke-width':1.5, fill:'none' });
-        edgesG.appendChild(path);
-        try{ drawConnectorDecor(path, c.label || null, decorG, positions, [c.a, c.b]); }catch(e){}
-      }
+      // Trim path at node edges so arrows don't go through nodes
+      const trimmed = trimPathAtNodeEdges(dFull, pa, pb);
+      const d = trimmed.d;
+
+      const g = svgEl('g');
+      const hitPath = svgEl('path', { d: dFull, stroke:'transparent', 'stroke-width':12, fill:'none' });
+      g.appendChild(hitPath);
+      const path = svgEl('path', { d, stroke:'#333', 'stroke-width':1.5, fill:'none' });
+      g.appendChild(path);
+      try{ drawConnectorDecor(path, c.label || null, g, positions, [c.a, c.b], !!c.bidi); }catch(e){}
+      addEdgeClickHandler(g);
+      edgesG.appendChild(g);
     }
 
     // Draw flows (asset-storage) using orthogonal routing
@@ -1462,6 +1759,8 @@ S2: cache</textarea>
       // Use port-based routing
       const { srcPort: pFrom, dstPort: pTo, srcDir, dstDir } = selectPortsAware(assetId, pa, 'asset', storageId, ps, 'storage', portUsage);
 
+      const fg = svgEl('g');
+
       if(f.arrow === '<->'){
         // Bidirectional: two cubic Bézier arcs respecting port directions
         const dirVec = { right:[1,0], left:[-1,0], top:[0,-1], bottom:[0,1] };
@@ -1471,20 +1770,33 @@ S2: cache</textarea>
         const pull = dist * 0.4;
         const spread = Math.min(20, dist * 0.15);
         const spx = -sv[1], spy = sv[0];
+        // Determine which position object corresponds to pFrom and pTo
+        const fromPos = (pFrom.x === pa.x && pFrom.y === pa.y) ? pa : ps;
+        const toPos = (pTo.x === pa.x && pTo.y === pa.y) ? pa : ps;
         let firstPath = null;
         for(const sign of [1, -1]){
           const c1x = pFrom.x + sv[0] * pull + spx * spread * sign;
           const c1y = pFrom.y + sv[1] * pull + spy * spread * sign;
           const c2x = pTo.x + dv[0] * pull + spx * spread * sign;
           const c2y = pTo.y + dv[1] * pull + spy * spread * sign;
-          let d;
+          let dFull;
           if(sign === 1){
-            d = `M ${pFrom.x} ${pFrom.y} C ${c1x} ${c1y} ${c2x} ${c2y} ${pTo.x} ${pTo.y}`;
+            dFull = `M ${pFrom.x} ${pFrom.y} C ${c1x} ${c1y} ${c2x} ${c2y} ${pTo.x} ${pTo.y}`;
           } else {
-            d = `M ${pTo.x} ${pTo.y} C ${c2x} ${c2y} ${c1x} ${c1y} ${pFrom.x} ${pFrom.y}`;
+            dFull = `M ${pTo.x} ${pTo.y} C ${c2x} ${c2y} ${c1x} ${c1y} ${pFrom.x} ${pFrom.y}`;
           }
+          const hitPath = svgEl('path', { d: dFull, stroke:'transparent', 'stroke-width':12, fill:'none' });
+          fg.appendChild(hitPath);
+          // Trim Bézier at node edges: create temp path in DOM for measurement
+          const tempPath = svgEl('path', { d: dFull, fill:'none', stroke:'none' });
+          svg.appendChild(tempPath);
+          const arcSrc = (sign === 1) ? fromPos : toPos;
+          const arcDst = (sign === 1) ? toPos : fromPos;
+          const trimResult = trimBezierAtNodeEdges(tempPath, arcSrc, arcDst);
+          svg.removeChild(tempPath);
+          const d = trimResult ? trimResult.d : dFull;
           const path = svgEl('path', { d, stroke:'#333', 'stroke-width':1.5, fill:'none', 'marker-end':'url(#arrow-small)' });
-          edgesG.appendChild(path);
+          fg.appendChild(path);
           if(!firstPath) firstPath = path;
         }
 
@@ -1498,8 +1810,8 @@ S2: cache</textarea>
             const rect = svgEl('rect', { x: pos.x - (m.width/2) - padX, y: pos.y - (m.height/2) - padY, width: m.width + padX*2, height: m.height + padY*2, rx:4, fill:'#fff', stroke:'#e6e6e6', opacity:0.85 });
             const textEl = svgEl('text', { x: pos.x, y: pos.y + (m.height/2) - 2, 'text-anchor':'middle', 'font-size':11, 'font-family':'Inter, Arial, sans-serif', fill:'#333', opacity:0.7 });
             textEl.textContent = lbl;
-            decorG.appendChild(rect);
-            decorG.appendChild(textEl);
+            fg.appendChild(rect);
+            fg.appendChild(textEl);
           }catch(e){}
         }
       } else {
@@ -1520,9 +1832,19 @@ S2: cache</textarea>
         } else {
           ({ srcPort, dstPort, srcDir: sDir, dstDir: dDir } = selectPortsAware(assetId, pa, 'asset', storageId, ps, 'storage', portUsage));
         }
-        const d = orthogonalPath(srcPort.x, srcPort.y, dstPort.x, dstPort.y, sDir, dDir);
+        const flowExcl = [...nodeAndAncestors(assetId), ...nodeAndAncestors(storageId)];
+        const dFull = orthogonalPath(srcPort.x, srcPort.y, dstPort.x, dstPort.y, sDir, dDir, positions, flowExcl);
+
+        // Determine source/dest positions for trimming (srcPort comes from one, dstPort from the other)
+        const flowSrcPos = (srcPort.x === pa.x && srcPort.y === pa.y) ? pa : ps;
+        const flowDstPos = (dstPort.x === pa.x && dstPort.y === pa.y) ? pa : ps;
+        const trimmed = trimPathAtNodeEdges(dFull, flowSrcPos, flowDstPos);
+        const d = trimmed.d;
+
+        const hitPath = svgEl('path', { d: dFull, stroke:'transparent', 'stroke-width':12, fill:'none' });
+        fg.appendChild(hitPath);
         const path = svgEl('path', { d, stroke:'#333', 'stroke-width':1.5, fill:'none', 'marker-end':'url(#arrow-small)' });
-        edgesG.appendChild(path);
+        fg.appendChild(path);
         // optional label
         if(f.label){
           try{
@@ -1533,11 +1855,14 @@ S2: cache</textarea>
             const rect = svgEl('rect', { x: pos.x - (m.width/2) - padX, y: pos.y - (m.height/2) - padY, width: m.width + padX*2, height: m.height + padY*2, rx:4, fill:'#fff', stroke:'#e6e6e6', opacity:0.85 });
             const textEl = svgEl('text', { x: pos.x, y: pos.y + (m.height/2) - 2, 'text-anchor':'middle', 'font-size':11, 'font-family':'Inter, Arial, sans-serif', fill:'#333', opacity:0.7 });
             textEl.textContent = lbl;
-            decorG.appendChild(rect);
-            decorG.appendChild(textEl);
+            fg.appendChild(rect);
+            fg.appendChild(textEl);
           }catch(e){}
         }
       }
+
+      addEdgeClickHandler(fg);
+      edgesG.appendChild(fg);
     }
 
     function drawNode(n){
@@ -1952,6 +2277,8 @@ S2: cache</textarea>
         }
       }
       debouncedRender();
+      prevAssetIds = getIdsByLine(assetsTA.value);
+      prevStorageIds = getIdsByLine(storagesTA.value);
       // small non-blocking notification
       console.info('Import successful');
     }catch(e){
@@ -2008,6 +2335,8 @@ S2: cache</textarea>
         summary.textContent = '';
         colorMap.clear();
         debouncedRender();
+        prevAssetIds = [];
+        prevStorageIds = [];
       });
     }
   });
@@ -2060,8 +2389,38 @@ S2: cache</textarea>
     debouncedRender();
   }));
   // ensure auto-id insertion still runs for assets/storages; also re-decorate annotated editors
-  assetsTA.addEventListener('input', (e) => { handleAutoIdInsertion(assetsTA, 'A'); decorateEditor(insideTA); decorateEditor(connectorsTA); debouncedRender(); });
-  storagesTA.addEventListener('input', (e) => { handleAutoIdInsertion(storagesTA, 'S'); decorateEditor(insideTA); decorateEditor(connectorsTA); debouncedRender(); });
+  // Track previous IDs for rename detection
+  let prevAssetIds = getIdsByLine(assetsTA.value);
+  let prevStorageIds = getIdsByLine(storagesTA.value);
+
+  assetsTA.addEventListener('input', (e) => {
+    handleAutoIdInsertion(assetsTA, 'A');
+    const newIds = getIdsByLine(assetsTA.value);
+    const renames = detectRenames(prevAssetIds, newIds);
+    if(renames.length){
+      applyRenames(insideTA, renames);
+      applyRenames(connectorsTA, renames);
+      for(const r of renames){
+        if(colorMap.has(r.from)){ colorMap.set(r.to, colorMap.get(r.from)); colorMap.delete(r.from); }
+      }
+    }
+    prevAssetIds = newIds;
+    decorateEditor(insideTA); decorateEditor(connectorsTA); debouncedRender();
+  });
+  storagesTA.addEventListener('input', (e) => {
+    handleAutoIdInsertion(storagesTA, 'S');
+    const newIds = getIdsByLine(storagesTA.value);
+    const renames = detectRenames(prevStorageIds, newIds);
+    if(renames.length){
+      applyRenames(insideTA, renames);
+      applyRenames(connectorsTA, renames);
+      for(const r of renames){
+        if(colorMap.has(r.from)){ colorMap.set(r.to, colorMap.get(r.from)); colorMap.delete(r.from); }
+      }
+    }
+    prevStorageIds = newIds;
+    decorateEditor(insideTA); decorateEditor(connectorsTA); debouncedRender();
+  });
 
   // initial render (seed default colors then render)
   colorMap.set('A3M', '#dff7df');
