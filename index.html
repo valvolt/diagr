@@ -1012,21 +1012,22 @@ S2: cache</textarea>
     function edgeSteps(a, b){
       const pa = pos[a], pb = pos[b];
       if(!pa || !pb) return 4;
+      // Manhattan distance as fractional tiebreaker (normalized to <1)
+      const dist = (Math.abs(pa.row - pb.row) + Math.abs(pa.col - pb.col)) / (rows + cols);
       if(pa.row === pb.row){
         const minC = Math.min(pa.col, pb.col), maxC = Math.max(pa.col, pb.col);
-        for(let c = minC + 1; c < maxC; c++) if(grid[pa.row][c]) return 3;
-        return 1;
+        for(let c = minC + 1; c < maxC; c++) if(grid[pa.row][c]) return 3 + dist;
+        return 1 + dist;
       }
       if(pa.col === pb.col){
         const minR = Math.min(pa.row, pb.row), maxR = Math.max(pa.row, pb.row);
-        for(let r = minR + 1; r < maxR; r++) if(grid[r][pa.col]) return 3;
-        return 1;
+        for(let r = minR + 1; r < maxR; r++) if(grid[r][pa.col]) return 3 + dist;
+        return 1 + dist;
       }
-      // Diagonal = L-shape; check if at least one corner is clear
       const c1 = grid[pa.row]?.[pb.col], c2 = grid[pb.row]?.[pa.col];
-      if(!c1 || c1 === a || c1 === b) return 2;
-      if(!c2 || c2 === a || c2 === b) return 2;
-      return 3;
+      if(!c1 || c1 === a || c1 === b) return 2 + dist;
+      if(!c2 || c2 === a || c2 === b) return 2 + dist;
+      return 3 + dist;
     }
     function totalArrowSteps(){
       let sum = 0;
@@ -1189,7 +1190,7 @@ S2: cache</textarea>
         for(const [a, b] of edgePairs){
           const pa = pos[a], pb = pos[b];
           if(!pa || !pb) continue;
-          if(edgeSteps(a, b) <= 1) continue; // already optimal
+          if(edgeSteps(a, b) < 2) continue; // straight unblocked (1.x) — skip
 
           let bestSwap = null, bestScore = totalArrowSteps();
 
@@ -1597,6 +1598,43 @@ S2: cache</textarea>
         }
       }
     }
+
+    // Post-layout: swap siblings to minimize total edge length (including cross-parent edges)
+    (function refineBySwap(){
+      function totalEdgeLength(){
+        let sum = 0;
+        for(const e of edgesForLayout){
+          const ps = positions[e.source], pt = positions[e.target];
+          if(ps && pt) sum += Math.abs(ps.x - pt.x) + Math.abs(ps.y - pt.y);
+        }
+        return sum;
+      }
+      let improved = true, passes = 0;
+      while(improved && passes < 10){
+        improved = false;
+        passes++;
+        for(const [parent, children] of insideMap.entries()){
+          if(children.length < 2) continue;
+          for(let i = 0; i < children.length; i++){
+            for(let j = i + 1; j < children.length; j++){
+              const a = children[i], b = children[j];
+              const pa = positions[a], pb = positions[b];
+              if(!pa || !pb) continue;
+              const before = totalEdgeLength();
+              positions[a] = { x: pb.x, y: pb.y, width: pa.width, height: pa.height };
+              positions[b] = { x: pa.x, y: pa.y, width: pb.width, height: pb.height };
+              const after = totalEdgeLength();
+              if(after < before){
+                improved = true;
+              } else {
+                positions[a] = pa;
+                positions[b] = pb;
+              }
+            }
+          }
+        }
+      }
+    })();
 
     // helper: collision detection & safe-point selection for labels/decorations
     // NOTE: these helpers use `positions` which is defined above (node center + size)
