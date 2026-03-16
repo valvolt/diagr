@@ -66,6 +66,11 @@ Open the file in a and edit the left panes; the diagram auto-updates.
     .resize-handle{width:6px;cursor:col-resize;background:transparent;transition:background 0.15s;flex-shrink:0;border-radius:3px;margin:0}
     .resize-handle:hover,.resize-handle.dragging{background:#c0c8d4}
     .left-footer{flex:0 0 auto;text-align:center;padding:4px 0 0}
+    .ac-dropdown{display:none;position:fixed;background:#fff;border:1px solid #e2e8f0;border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,0.12);max-height:160px;overflow-y:auto;z-index:1000;font-family:monospace;font-size:13px}
+    .ac-dropdown .ac-item{padding:4px 10px;cursor:pointer}
+    .ac-dropdown .ac-item.active{background:#e8f0fe}
+    .ac-dropdown .ac-item .ac-id{font-weight:600}
+    .ac-dropdown .ac-item .ac-label{color:#555;margin-left:6px}
   </style>
 
   <!-- dagre (layout) via CDN; if unavailable the app falls back to a simple grid layout -->
@@ -158,6 +163,7 @@ S2: cache</textarea>
       <div class="footer">Open this file locally in your browser. No server required.</div>
     </div>
   </div>
+  <div id="ac-dropdown" class="ac-dropdown"></div>
 
 <script>
 (() => {
@@ -399,6 +405,111 @@ S2: cache</textarea>
   // Initialize annotated editors
   makeAnnotatedEditor(insideTA);
   makeAnnotatedEditor(connectorsTA);
+
+  // --- Autocomplete: type a label to insert the corresponding ID ---
+  (function initAutocomplete(){
+    const acEl = document.getElementById('ac-dropdown');
+    if(!acEl) return;
+    let acState = null; // { editor, wordStart, items, sel }
+
+    function hideAc(){ acEl.style.display = 'none'; acState = null; }
+
+    function showAc(editor, wordStart, items){
+      if(!items.length){ hideAc(); return; }
+      acState = { editor, wordStart, items, sel: 0 };
+      acEl.innerHTML = '';
+      items.forEach((it, i) => {
+        const div = document.createElement('div');
+        div.className = 'ac-item' + (i === 0 ? ' active' : '');
+        div.innerHTML = '<span class="ac-id">' + escHtml(it.id) + '</span><span class="ac-label">' + escHtml(it.label) + '</span>';
+        div.addEventListener('mousedown', (e) => { e.preventDefault(); acceptAc(i); });
+        acEl.appendChild(div);
+      });
+      // Position near caret
+      const sel = window.getSelection();
+      if(sel.rangeCount){
+        const r = sel.getRangeAt(0).getBoundingClientRect();
+        acEl.style.left = r.left + 'px';
+        acEl.style.top = (r.bottom + 2) + 'px';
+      }
+      acEl.style.display = 'block';
+    }
+
+    function updateSel(idx){
+      if(!acState) return;
+      acState.sel = idx;
+      const items = acEl.querySelectorAll('.ac-item');
+      items.forEach((el, i) => el.classList.toggle('active', i === idx));
+      if(items[idx]) items[idx].scrollIntoView({ block: 'nearest' });
+    }
+
+    function acceptAc(idx){
+      if(!acState) return;
+      const { editor, wordStart, items } = acState;
+      const chosen = items[idx || acState.sel];
+      if(!chosen){ hideAc(); return; }
+      const raw = editor.value;
+      const caretOff = getCaretOffset(editor);
+      const before = raw.slice(0, wordStart) + chosen.id;
+      const after = raw.slice(caretOff);
+      const newCaret = before.length;
+      hideAc();
+      editor.value = before + after;
+      setCaretOffset(editor, newCaret);
+    }
+
+    function tryAutocomplete(editor){
+      const raw = editor.value;
+      const caret = getCaretOffset(editor);
+      // Find word boundary: walk back from caret to whitespace or operator
+      let ws = caret;
+      while(ws > 0 && !/[\s<\->:]/.test(raw[ws - 1])) ws--;
+      const word = raw.slice(ws, caret);
+      if(word.length < 2){ hideAc(); return; }
+      const lc = word.toLowerCase();
+      const idLabelMap = buildIdLabelMap();
+      const matches = [];
+      for(const [id, label] of idLabelMap){
+        if(id.toLowerCase() === lc) { hideAc(); return; } // exact ID match — no dropdown
+        if(label.toLowerCase().startsWith(lc) || id.toLowerCase().startsWith(lc)){
+          matches.push({ id, label });
+        }
+      }
+      // Also try substring match if no startsWith hits
+      if(!matches.length){
+        for(const [id, label] of idLabelMap){
+          if(label.toLowerCase().includes(lc)){
+            matches.push({ id, label });
+          }
+        }
+      }
+      if(matches.length) showAc(editor, ws, matches.slice(0, 8));
+      else hideAc();
+    }
+
+    // Hook into both editors
+    [insideTA, connectorsTA].forEach(editor => {
+      editor.addEventListener('input', () => tryAutocomplete(editor));
+      editor.addEventListener('keydown', (e) => {
+        if(!acState || acState.editor !== editor) return;
+        if(e.key === 'ArrowDown'){
+          e.preventDefault();
+          updateSel((acState.sel + 1) % acState.items.length);
+        } else if(e.key === 'ArrowUp'){
+          e.preventDefault();
+          updateSel((acState.sel - 1 + acState.items.length) % acState.items.length);
+        } else if(e.key === 'Enter' || e.key === 'Tab'){
+          e.preventDefault();
+          e.stopImmediatePropagation(); // prevent makeAnnotatedEditor's Enter handler
+          acceptAc();
+        } else if(e.key === 'Escape'){
+          e.preventDefault();
+          hideAc();
+        }
+      });
+      editor.addEventListener('blur', () => setTimeout(hideAc, 150));
+    });
+  })();
 
   // Set default content
   insideTA.value = 'A2 in A3M\nS1 in A3M\nS2 in A2';
