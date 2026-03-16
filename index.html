@@ -62,7 +62,9 @@ Open the file in a and edit the left panes; the diagram auto-updates.
     button{padding:6px 10px;border-radius:6px;background:var(--accent);color:#fff;border:none;cursor:pointer}
     .footer{font-size:12px;color:var(--muted);text-align:right}
     /* responsive */
-    @media (max-width:880px){ .app{flex-direction:column} .left{width:100%;order:2} .right{order:1;height:50vh} }
+    @media (max-width:880px){ .app{flex-direction:column} .left{width:100%;order:2} .right{order:1;height:50vh} .resize-handle{display:none} }
+    .resize-handle{width:6px;cursor:col-resize;background:transparent;transition:background 0.15s;flex-shrink:0;border-radius:3px;margin:0}
+    .resize-handle:hover,.resize-handle.dragging{background:#c0c8d4}
   </style>
 
   <!-- dagre (layout) via CDN; if unavailable the app falls back to a simple grid layout -->
@@ -112,6 +114,8 @@ S2: cache</textarea>
         <div id="connectors-err" class="errors" style="display:none"></div>
       </div>
     </div>
+
+    <div class="resize-handle" id="resize-handle"></div>
 
     <div class="right">
       <div style="display:flex;justify-content:space-between;align-items:center">
@@ -397,6 +401,31 @@ S2: cache</textarea>
   // Set default content
   insideTA.value = 'A2 in A3M\nS1 in A3M\nS2 in A2';
   connectorsTA.value = 'H1 -> A1\nH2 -> A1\nA1 -> A2 : https\nA2 <-> S1 : jdbc';
+
+  // Persist editor state to localStorage
+  function saveState(){
+    try{
+      const colors = {};
+      if(typeof colorMap !== 'undefined') colorMap.forEach((v,k) => { if(v) colors[k] = v; });
+      localStorage.setItem('tam-editor-state', JSON.stringify({
+        assets: assetsTA.value,
+        storages: storagesTA.value,
+        inside: insideTA.value,
+        connectors: connectorsTA.value,
+        colors: colors
+      }));
+    }catch(e){}
+  }
+  // Restore saved state (overrides defaults)
+  try{
+    const saved = JSON.parse(localStorage.getItem('tam-editor-state'));
+    if(saved){
+      if(saved.assets != null) assetsTA.value = saved.assets;
+      if(saved.storages != null) storagesTA.value = saved.storages;
+      if(saved.inside != null) insideTA.value = saved.inside;
+      if(saved.connectors != null) connectorsTA.value = saved.connectors;
+    }
+  }catch(e){}
 
   // Measure text using a temporary SVG text element
   function measureTextSVG(text, fontSize=14, fontFamily='Inter, Arial, sans-serif'){
@@ -1965,6 +1994,7 @@ S2: cache</textarea>
               const next = (idx + 1) % palette.length;
               colorMap.set(id, palette[next]);
               debouncedRender();
+              saveState();
             }, 250);
             clickTimers.set(id, t);
           }
@@ -1974,6 +2004,7 @@ S2: cache</textarea>
             if(t){ clearTimeout(t); clickTimers.delete(id); }
             colorMap.set(id, null);
             debouncedRender();
+            saveState();
           }
           grp.addEventListener('click', onClick);
           grp.addEventListener('dblclick', onDblClick);
@@ -2015,6 +2046,7 @@ S2: cache</textarea>
               const next = (idx + 1) % palette.length;
               colorMap.set(id, palette[next]);
               debouncedRender();
+              saveState();
             }, 250);
             clickTimers.set(id, t);
           }
@@ -2024,6 +2056,7 @@ S2: cache</textarea>
             if(t){ clearTimeout(t); clickTimers.delete(id); }
             colorMap.set(id, null);
             debouncedRender();
+            saveState();
           }
           grp.addEventListener('click', onClick);
           grp.addEventListener('dblclick', onDblClick);
@@ -2279,6 +2312,7 @@ S2: cache</textarea>
       debouncedRender();
       prevAssetIds = getIdsByLine(assetsTA.value);
       prevStorageIds = getIdsByLine(storagesTA.value);
+      saveState();
       // small non-blocking notification
       console.info('Import successful');
     }catch(e){
@@ -2337,6 +2371,7 @@ S2: cache</textarea>
         debouncedRender();
         prevAssetIds = [];
         prevStorageIds = [];
+        try{ localStorage.removeItem('tam-editor-state'); }catch(e){}
       });
     }
   });
@@ -2387,6 +2422,7 @@ S2: cache</textarea>
   [connectorsTA, insideTA].forEach(el => el.addEventListener('input', () => {
     decorateEditor(el);
     debouncedRender();
+    saveState();
   }));
   // ensure auto-id insertion still runs for assets/storages; also re-decorate annotated editors
   // Track previous IDs for rename detection
@@ -2406,6 +2442,7 @@ S2: cache</textarea>
     }
     prevAssetIds = newIds;
     decorateEditor(insideTA); decorateEditor(connectorsTA); debouncedRender();
+    saveState();
   });
   storagesTA.addEventListener('input', (e) => {
     handleAutoIdInsertion(storagesTA, 'S');
@@ -2420,14 +2457,51 @@ S2: cache</textarea>
     }
     prevStorageIds = newIds;
     decorateEditor(insideTA); decorateEditor(connectorsTA); debouncedRender();
+    saveState();
   });
 
   // initial render (seed default colors then render)
   colorMap.set('A3M', '#dff7df');
   colorMap.set('H1', '#f7d8ea');
   colorMap.set('H2', '#d8eaf7');
+  // Restore saved colors (overrides defaults)
+  try{
+    const saved = JSON.parse(localStorage.getItem('tam-editor-state'));
+    if(saved && saved.colors){
+      colorMap.clear();
+      for(const [k,v] of Object.entries(saved.colors)) colorMap.set(k, v);
+    }
+  }catch(e){}
   window.addEventListener('load', () => { debouncedRender(); });
   window.__diagramRender = render;
+
+  // --- Resizable left sidebar ---
+  (function initResize(){
+    const handle = document.getElementById('resize-handle');
+    const left = document.querySelector('.left');
+    if(!handle || !left) return;
+    let startX, startW;
+    handle.addEventListener('pointerdown', function(e){
+      e.preventDefault();
+      handle.setPointerCapture(e.pointerId);
+      handle.classList.add('dragging');
+      startX = e.clientX;
+      startW = left.getBoundingClientRect().width;
+      document.body.style.userSelect = 'none';
+    });
+    handle.addEventListener('pointermove', function(e){
+      if(!handle.classList.contains('dragging')) return;
+      const w = Math.min(600, Math.max(200, startW + (e.clientX - startX)));
+      left.style.width = w + 'px';
+    });
+    function stopDrag(e){
+      if(!handle.classList.contains('dragging')) return;
+      handle.classList.remove('dragging');
+      document.body.style.userSelect = '';
+    }
+    handle.addEventListener('pointerup', stopDrag);
+    handle.addEventListener('pointercancel', stopDrag);
+  })();
 })();
 </script>
 </body>
