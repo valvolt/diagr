@@ -294,7 +294,13 @@ S2: cache</textarea>
     while((node = walker.nextNode())){
       const text = node.textContent.replace(/\u00a0/g, ' ');
       if(remaining <= text.length){
-        range.setStart(node, Math.min(remaining, node.textContent.length));
+        // If caret would land right after a \n, skip to next text node (start of new line)
+        const posInNode = Math.min(remaining, node.textContent.length);
+        if(posInNode > 0 && node.textContent[posInNode - 1] === '\n' && posInNode === remaining){
+          remaining -= text.length;
+          continue;
+        }
+        range.setStart(node, posInNode);
         range.collapse(true);
         sel.removeAllRanges();
         sel.addRange(range);
@@ -371,6 +377,10 @@ S2: cache</textarea>
       if(i > 0) html += '\n';
       html += annotateLine(lines[i], idLabelMap);
     }
+    // Append <br> when content ends with a newline (empty last line) so the
+    // browser renders an empty line the caret can visually sit on
+    if(raw.endsWith('\n') || (lines.length > 1 && lines[lines.length - 1] === ''))
+      html += '<br>';
     el.innerHTML = html;
 
     if(caretOff !== null){
@@ -932,43 +942,59 @@ S2: cache</textarea>
       }
     }
 
-    // 3. Try S-shape
+    // 3. Try S-shape with multiple midpoints
     if(srcH && dstH){
-      const midX = (x1 + x2) / 2;
-      const ptsS = [[x1,y1],[midX,y1],[midX,y2],[x2,y2]];
-      if(validFirst(midX, y1) && validLast(midX, y2) && !segmentHitsObstacle(ptsS)){
-        return buildPath(ptsS);
+      for(const t of [0.5, 0.3, 0.7, 0.2, 0.8]){
+        const midX = x1 + (x2 - x1) * t;
+        const ptsS = [[x1,y1],[midX,y1],[midX,y2],[x2,y2]];
+        if(validFirst(midX, y1) && validLast(midX, y2) && !segmentHitsObstacle(ptsS)){
+          return buildPath(ptsS);
+        }
       }
     }
     if(!srcH && !dstH){
-      const midY = (y1 + y2) / 2;
-      const ptsS = [[x1,y1],[x1,midY],[x2,midY],[x2,y2]];
-      if(validFirst(x1, midY) && validLast(x2, midY) && !segmentHitsObstacle(ptsS)){
-        return buildPath(ptsS);
+      for(const t of [0.5, 0.3, 0.7, 0.2, 0.8]){
+        const midY = y1 + (y2 - y1) * t;
+        const ptsS = [[x1,y1],[x1,midY],[x2,midY],[x2,y2]];
+        if(validFirst(x1, midY) && validLast(x2, midY) && !segmentHitsObstacle(ptsS)){
+          return buildPath(ptsS);
+        }
       }
     }
 
-    // 4. Fallback: clearance-based routing (U-shape or multi-step)
+    // 4. Fallback: clearance-based routing with obstacle avoidance
     const sv = dirVec[srcDir], ev = dirVec[dstDir];
-    const sx = x1 + sv[0] * CL, sy = y1 + sv[1] * CL;
-    const ex = x2 + ev[0] * CL, ey = y2 + ev[1] * CL;
-
-    if(Math.abs(sx - ex) < ALIGN_TOL || Math.abs(sy - ey) < ALIGN_TOL){
-      return buildPath([[x1,y1],[sx,sy],[ex,ey],[x2,y2]]);
+    for(const cl of [CL, 60, 100, 150]){
+      const sx = x1 + sv[0] * cl, sy = y1 + sv[1] * cl;
+      const ex = x2 + ev[0] * cl, ey = y2 + ev[1] * cl;
+      let candidate;
+      if(Math.abs(sx - ex) < ALIGN_TOL || Math.abs(sy - ey) < ALIGN_TOL){
+        candidate = [[x1,y1],[sx,sy],[ex,ey],[x2,y2]];
+      } else {
+        let bx, by;
+        if(isH(srcDir)){ bx = sx; by = ey; }
+        else { bx = ex; by = sy; }
+        candidate = [[x1,y1],[sx,sy],[bx,by],[ex,ey],[x2,y2]];
+      }
+      if(!segmentHitsObstacle(candidate)) return buildPath(candidate);
     }
-
-    let bx, by;
-    if(isH(srcDir)){
-      bx = sx; by = ey;
-    } else {
-      bx = ex; by = sy;
+    // Ultimate fallback: largest clearance unchecked
+    {
+      const sx = x1 + sv[0] * 150, sy = y1 + sv[1] * 150;
+      const ex = x2 + ev[0] * 150, ey = y2 + ev[1] * 150;
+      if(Math.abs(sx - ex) < ALIGN_TOL || Math.abs(sy - ey) < ALIGN_TOL){
+        return buildPath([[x1,y1],[sx,sy],[ex,ey],[x2,y2]]);
+      }
+      let bx, by;
+      if(isH(srcDir)){ bx = sx; by = ey; }
+      else { bx = ex; by = sy; }
+      return buildPath([[x1,y1],[sx,sy],[bx,by],[ex,ey],[x2,y2]]);
     }
-    return buildPath([[x1,y1],[sx,sy],[bx,by],[ex,ey],[x2,y2]]);
   }
 
   // Bidirectional: two parallel-offset orthogonal paths
   // Computes waypoints using the same constraint-aware logic, then offsets per segment
-  function bidirectionalOrthogonalPaths(x1, y1, x2, y2, srcDir, dstDir, offset){
+  function bidirectionalOrthogonalPaths(x1, y1, x2, y2, srcDir, dstDir, offset, obstacles, excludeIds){
     offset = offset || BIDI_OFFSET;
     const ALIGN_TOL = 5;
     const CL = 30;
@@ -989,6 +1015,34 @@ S2: cache</textarea>
       if(dstDir === 'bottom') return Math.abs(px - x2) < ALIGN_TOL && py > y2 + ALIGN_TOL;
       return true;
     }
+    function segmentHitsObstacle(pts){
+      if(!obstacles) return false;
+      for(const id in obstacles){
+        if(excludeIds && excludeIds.includes(id)) continue;
+        const o = obstacles[id];
+        const left = o.x - o.width/2 + 2, right = o.x + o.width/2 - 2;
+        const top = o.y - o.height/2 + 2, bottom = o.y + o.height/2 - 2;
+        for(let i = 0; i < pts.length - 1; i++){
+          const ax = pts[i][0], ay = pts[i][1];
+          const bx = pts[i+1][0], by = pts[i+1][1];
+          if(Math.abs(ay - by) < 1){
+            const segY = ay;
+            if(segY > top && segY < bottom){
+              const segL = Math.min(ax, bx), segR = Math.max(ax, bx);
+              if(segR > left && segL < right) return true;
+            }
+          }
+          if(Math.abs(ax - bx) < 1){
+            const segX = ax;
+            if(segX > left && segX < right){
+              const segT = Math.min(ay, by), segB = Math.max(ay, by);
+              if(segB > top && segT < bottom) return true;
+            }
+          }
+        }
+      }
+      return false;
+    }
 
     // Compute waypoints using same priority as orthogonalPath
     let pts = null;
@@ -996,27 +1050,58 @@ S2: cache</textarea>
 
     // 1. Straight
     if(Math.abs(y1 - y2) < ALIGN_TOL || Math.abs(x1 - x2) < ALIGN_TOL){
-      if(validFirst(x2, y2) && validLast(x1, y1)) pts = [[x1,y1],[x2,y2]];
+      if(validFirst(x2, y2) && validLast(x1, y1)){
+        const candidate = [[x1,y1],[x2,y2]];
+        if(!segmentHitsObstacle(candidate)) pts = candidate;
+      }
     }
     // 2. L-shape
     if(!pts && srcH !== dstH){
-      if(validFirst(x2, y1) && validLast(x2, y1)) pts = [[x1,y1],[x2,y1],[x2,y2]];
-      else if(validFirst(x1, y2) && validLast(x1, y2)) pts = [[x1,y1],[x1,y2],[x2,y2]];
+      const ptsA = [[x1,y1],[x2,y1],[x2,y2]];
+      if(validFirst(x2, y1) && validLast(x2, y1) && !segmentHitsObstacle(ptsA)) pts = ptsA;
+      if(!pts){
+        const ptsB = [[x1,y1],[x1,y2],[x2,y2]];
+        if(validFirst(x1, y2) && validLast(x1, y2) && !segmentHitsObstacle(ptsB)) pts = ptsB;
+      }
     }
-    // 3. S-shape
+    // 3. S-shape with multiple midpoints
     if(!pts && srcH && dstH){
-      const midX = (x1 + x2) / 2;
-      if(validFirst(midX, y1) && validLast(midX, y2)) pts = [[x1,y1],[midX,y1],[midX,y2],[x2,y2]];
+      for(const t of [0.5, 0.3, 0.7, 0.2, 0.8]){
+        const midX = x1 + (x2 - x1) * t;
+        const candidate = [[x1,y1],[midX,y1],[midX,y2],[x2,y2]];
+        if(validFirst(midX, y1) && validLast(midX, y2) && !segmentHitsObstacle(candidate)){ pts = candidate; break; }
+      }
     }
     if(!pts && !srcH && !dstH){
-      const midY = (y1 + y2) / 2;
-      if(validFirst(x1, midY) && validLast(x2, midY)) pts = [[x1,y1],[x1,midY],[x2,midY],[x2,y2]];
+      for(const t of [0.5, 0.3, 0.7, 0.2, 0.8]){
+        const midY = y1 + (y2 - y1) * t;
+        const candidate = [[x1,y1],[x1,midY],[x2,midY],[x2,y2]];
+        if(validFirst(x1, midY) && validLast(x2, midY) && !segmentHitsObstacle(candidate)){ pts = candidate; break; }
+      }
     }
-    // 4. Clearance fallback
+    // 4. Clearance fallback with obstacle avoidance
     if(!pts){
       const sv = dirVec[srcDir], ev = dirVec[dstDir];
-      const sx = x1 + sv[0] * CL, sy = y1 + sv[1] * CL;
-      const ex = x2 + ev[0] * CL, ey = y2 + ev[1] * CL;
+      for(const cl of [CL, 60, 100, 150]){
+        const sx = x1 + sv[0] * cl, sy = y1 + sv[1] * cl;
+        const ex = x2 + ev[0] * cl, ey = y2 + ev[1] * cl;
+        let candidate;
+        if(Math.abs(sx - ex) < ALIGN_TOL || Math.abs(sy - ey) < ALIGN_TOL){
+          candidate = [[x1,y1],[sx,sy],[ex,ey],[x2,y2]];
+        } else {
+          let bx, by;
+          if(isH(srcDir)){ bx = sx; by = ey; }
+          else { bx = ex; by = sy; }
+          candidate = [[x1,y1],[sx,sy],[bx,by],[ex,ey],[x2,y2]];
+        }
+        if(!segmentHitsObstacle(candidate)){ pts = candidate; break; }
+      }
+    }
+    // Ultimate fallback
+    if(!pts){
+      const sv = dirVec[srcDir], ev = dirVec[dstDir];
+      const sx = x1 + sv[0] * 150, sy = y1 + sv[1] * 150;
+      const ex = x2 + ev[0] * 150, ey = y2 + ev[1] * 150;
       if(Math.abs(sx - ex) < ALIGN_TOL || Math.abs(sy - ey) < ALIGN_TOL){
         pts = [[x1,y1],[sx,sy],[ex,ey],[x2,y2]];
       } else {
@@ -1113,7 +1198,14 @@ S2: cache</textarea>
     // pos[id] = {row, col}
     const pos = {};
     for(let i = 0; i < n; i++){
-      const r = Math.floor(i / cols), c = i % cols;
+      let r, c;
+      if(opts.vertical){
+        r = i % rows;
+        c = Math.floor(i / rows);
+      } else {
+        r = Math.floor(i / cols);
+        c = i % cols;
+      }
       grid[r][c] = nodes[i].id;
       pos[nodes[i].id] = { row: r, col: c };
     }
@@ -1474,6 +1566,12 @@ S2: cache</textarea>
     const insideLines = parseLines(insideTA && insideTA.value ? insideTA.value : '');
     insidePairs = parseInside(insideLines);
 
+    // Build a set of inside pairs for fast lookup (child|parent)
+    const insidePairSet = new Set();
+    for(const ip of insidePairs){
+      insidePairSet.add(ip.child + '|' + ip.parent);
+    }
+
     // Unified parsing: classify each connector line as connector (asset↔asset) or flow (asset↔storage)
     const validConnectors = [];
     const validFlows = [];
@@ -1483,6 +1581,12 @@ S2: cache</textarea>
       const left = m[1].trim(), arrow = m[2], right = m[3].trim(), label = (m[4]||'').trim();
       const leftIsAsset = assetMap.has(left), rightIsAsset = assetMap.has(right);
       const leftIsStorage = storageMap.has(left), rightIsStorage = storageMap.has(right);
+
+      // Reject connectors/flows between nodes with an inside relationship
+      if(insidePairSet.has(left + '|' + right) || insidePairSet.has(right + '|' + left)){
+        errors.push(`Cannot connect ${left} and ${right}: one is inside the other`);
+        continue;
+      }
 
       if(leftIsAsset && rightIsAsset){
         let a = left, b = right, bidi = arrow === '<->';
@@ -1641,19 +1745,26 @@ S2: cache</textarea>
           return (aExt ? 1 : 0) - (bExt ? 1 : 0);
         });
         const childNodes = sortedChildren.map(cid => nodeById[cid]).filter(Boolean);
-        const childLayout = computeLayout(childNodes, childEdges, {
+        const childLayoutH = computeLayout(childNodes, childEdges, {
           colSpacing: 30, rowSpacing: 30, marginX: 0, marginY: 0,
           maxPasses: 15, center: true, returnBounds: true
         });
+        const childLayoutV = computeLayout(childNodes, childEdges, {
+          colSpacing: 30, rowSpacing: 30, marginX: 0, marginY: 0,
+          maxPasses: 15, center: true, returnBounds: true, vertical: true
+        });
 
         const labelM = measureTextSVG(parentNode.label, 14);
-        const neededW = Math.max(parentNode.width, childLayout.gridW + padLeft + padRight);
-        const neededH = Math.max(parentNode.height, labelM.height + labelPadY + padTop + padBottom + childLayout.gridH);
+        // Size parent for worst case of both orientations
+        const maxGridW = Math.max(childLayoutH.gridW, childLayoutV.gridW);
+        const maxGridH = Math.max(childLayoutH.gridH, childLayoutV.gridH);
+        const neededW = Math.max(parentNode.width, maxGridW + padLeft + padRight);
+        const neededH = Math.max(parentNode.height, labelM.height + labelPadY + padTop + padBottom + maxGridH);
         if(neededW > parentNode.width) parentNode.width = neededW;
         if(neededH > parentNode.height) parentNode.height = neededH;
 
-        // Store child layout for later positioning
-        parentNode._childLayout = childLayout;
+        // Store both child layouts for later orientation selection
+        parentNode._childLayouts = { h: childLayoutH, v: childLayoutV };
       }
     }
 
@@ -1680,38 +1791,72 @@ S2: cache</textarea>
     }
     const positions = computeLayout(gridNodes, gridEdges);
 
-    // after layout, position children inside parents using pre-computed grid layout
+    // after layout, position children inside parents — try both H and V orientations, pick shorter total edge length
     if(typeof insideMap !== 'undefined' && insideMap && insideMap.size){
-      for(const [parent, children] of insideMap.entries()){
+      const parentsByDepthAsc = Array.from(insideMap.entries()).sort((a, b) =>
+        (depthMap.get(a[0]) || 0) - (depthMap.get(b[0]) || 0));
+      for(const [parent, children] of parentsByDepthAsc){
         const p = positions[parent];
         if(!p) continue;
         const parentNode = nodeById[parent];
-        const childLayout = parentNode._childLayout;
-        if(!childLayout) continue;
+        const layouts = parentNode._childLayouts;
+        if(!layouts) continue;
 
         const labelM = measureTextSVG(parentNode.label, 14);
-        // Anchor: center of available content area inside parent
-        const contentTop = (p.y - p.height/2) + labelM.height + labelPadY + padTop;
-        const contentCenterX = p.x;
-        const contentCenterY = contentTop + childLayout.gridH / 2;
 
-        for(const cid of children){
-          const cp = childLayout.positions[cid];
-          if(!cp) continue;
-          const cn = nodeById[cid];
-          if(!cn) continue;
-          positions[cid] = {
-            x: contentCenterX + cp.x,
-            y: contentCenterY + cp.y,
-            width: cn.width,
-            height: cn.height
-          };
+        function applyChildLayout(layout){
+          const contentTop = (p.y - p.height/2) + labelM.height + labelPadY + padTop;
+          const cCenterX = p.x;
+          const cCenterY = contentTop + layout.gridH / 2;
+          const snap = {};
+          for(const cid of children){
+            const cp = layout.positions[cid];
+            if(!cp) continue;
+            const cn = nodeById[cid];
+            if(!cn) continue;
+            snap[cid] = { x: cCenterX + cp.x, y: cCenterY + cp.y, width: cn.width, height: cn.height };
+          }
+          return snap;
         }
+
+        const snapH = applyChildLayout(layouts.h);
+        const snapV = applyChildLayout(layouts.v);
+
+        // Determine dominant direction of external edges from children
+        const childSet = new Set(children);
+        let hEdges = 0, vEdges = 0;
+        for(const cid of children){
+          for(const e of edgesForLayout){
+            let targetId = null;
+            if(e.source === cid && !childSet.has(e.target) && e.target !== parent) targetId = e.target;
+            if(e.target === cid && !childSet.has(e.source) && e.source !== parent) targetId = e.source;
+            if(!targetId) continue;
+            const tp = positions[targetId] || positions[topAncestor(targetId)];
+            if(!tp) continue;
+            const dx = Math.abs(tp.x - p.x);
+            const dy = Math.abs(tp.y - p.y);
+            if(dx >= dy) hEdges++;  // target is left/right → vertical stacking helps
+            else vEdges++;           // target is above/below → horizontal helps
+          }
+        }
+        const chosenSnap = hEdges > vEdges ? snapV : snapH;
+        for(const cid in chosenSnap) positions[cid] = chosenSnap[cid];
       }
     }
 
     // Post-layout: swap siblings to minimize total edge length (including cross-parent edges)
     (function refineBySwap(){
+      // Collect all descendants of a node (children, grandchildren, etc.)
+      function getDescendants(id){
+        const result = [];
+        const ch = insideMap.get(id);
+        if(!ch) return result;
+        for(const c of ch){
+          result.push(c);
+          result.push(...getDescendants(c));
+        }
+        return result;
+      }
       function totalEdgeLength(){
         let sum = 0;
         for(const e of edgesForLayout){
@@ -1731,15 +1876,30 @@ S2: cache</textarea>
               const a = children[i], b = children[j];
               const pa = positions[a], pb = positions[b];
               if(!pa || !pb) continue;
+              const dx = pb.x - pa.x, dy = pb.y - pa.y;
+              // Save positions of a, b, and all their descendants
+              const aDesc = getDescendants(a), bDesc = getDescendants(b);
+              const saved = {};
+              for(const id of [a, ...aDesc, b, ...bDesc]) saved[id] = positions[id];
               const before = totalEdgeLength();
+              // Swap a and b
               positions[a] = { x: pb.x, y: pb.y, width: pa.width, height: pa.height };
               positions[b] = { x: pa.x, y: pa.y, width: pb.width, height: pb.height };
+              // Move descendants by the corresponding delta
+              for(const d of aDesc){
+                if(!positions[d]) continue;
+                positions[d] = { ...positions[d], x: positions[d].x + dx, y: positions[d].y + dy };
+              }
+              for(const d of bDesc){
+                if(!positions[d]) continue;
+                positions[d] = { ...positions[d], x: positions[d].x - dx, y: positions[d].y - dy };
+              }
               const after = totalEdgeLength();
               if(after < before){
                 improved = true;
               } else {
-                positions[a] = pa;
-                positions[b] = pb;
+                // Restore all positions
+                for(const id in saved) positions[id] = saved[id];
               }
             }
           }
