@@ -49,7 +49,7 @@ A2 in A3
 S1 in A3
 ```
 
-Parents auto-resize to fit their children. Cycles are detected and rejected. As you type, recognized IDs show their labels as inline grey ghost text.
+Parents auto-resize to fit their children. Cycles are detected and rejected. As you type, recognized IDs show their labels as inline grey ghost text. You can either type the ID of an element (e.g. S1) or its label (e.g. Database).
 
 ### Connectors
 
