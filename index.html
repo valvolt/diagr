@@ -456,16 +456,32 @@ S2: cache</textarea>
     function acceptAc(idx){
       if(!acState) return;
       const { editor, wordStart, items } = acState;
-      const chosen = items[idx || acState.sel];
+      const chosen = items[idx !== undefined ? idx : acState.sel];
       if(!chosen){ hideAc(); return; }
       const raw = editor.value;
       const caretOff = getCaretOffset(editor);
-      const before = raw.slice(0, wordStart) + chosen.id;
+
+      // Extract text on the current line before the word being completed
+      let lineStart = wordStart;
+      while(lineStart > 0 && raw[lineStart - 1] !== '\n') lineStart--;
+      const linePrefix = raw.slice(lineStart, wordStart);
+
+      // Determine suffix: left-side completions get a syntax helper appended
+      let suffix = '';
+      if(editor === insideTA){
+        if(!/\sin\s/i.test(linePrefix)) suffix = ' in ';
+      } else if(editor === connectorsTA){
+        if(!/<->|->|<-/.test(linePrefix)) suffix = ' ';
+      }
+
+      const before = raw.slice(0, wordStart) + chosen.id + suffix;
       const after = raw.slice(caretOff);
       const newCaret = before.length;
       hideAc();
       editor.value = before + after;
       setCaretOffset(editor, newCaret);
+      debouncedRender();
+      saveState();
     }
 
     function tryAutocomplete(editor){
@@ -1911,6 +1927,14 @@ S2: cache</textarea>
     (function resolveOverlaps(){
       const ids = Object.keys(positions);
       let changed = true, passes = 0;
+      function isAncestor(nodeId, potentialAncestorId){
+        let cur = childParent.get(nodeId);
+        while(cur){
+          if(cur === potentialAncestorId) return true;
+          cur = childParent.get(cur);
+        }
+        return false;
+      }
       function moveDescendants(id, dx, dy){
         const ch = insideMap.get(id);
         if(!ch) return;
@@ -1931,7 +1955,7 @@ S2: cache</textarea>
             const pa = positions[a], pb = positions[b];
             if(!pa || !pb) continue;
             // Skip if one is inside the other (parent-child)
-            if(childParent.get(a) === b || childParent.get(b) === a) continue;
+            if(isAncestor(a, b) || isAncestor(b, a)) continue;
 
             const gap = 20; // minimum edge-to-edge gap
             const overlapX = Math.min(pa.x + pa.width/2, pb.x + pb.width/2)
